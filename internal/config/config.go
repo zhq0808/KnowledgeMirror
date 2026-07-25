@@ -9,15 +9,46 @@ import (
 
 // Config 是应用的全部配置
 type Config struct {
-	HTTP     HTTPConfig     `yaml:"http"     env-prefix:"HTTP_"`
-	Identity IdentityConfig `yaml:"identity" env-prefix:"IDENTITY_"`
-	Chat     ChatConfig     `yaml:"chat"     env-prefix:"CHAT_"`
-	DeepSeek LLMConfig      `yaml:"deepseek" env-prefix:"DEEPSEEK_"`
-	OpenAI   OpenAIConfig   `yaml:"openai"   env-prefix:"OPENAI_"`
-	Postgres PostgresConfig `yaml:"postgres" env-prefix:"POSTGRES_"`
-	Redis    RedisConfig    `yaml:"redis"    env-prefix:"REDIS_"`
-	Memory   MemoryConfig   `yaml:"memory"   env-prefix:"MEMORY_"`
-	Log      LogConfig      `yaml:"log"      env-prefix:"LOG_"`
+	HTTP      HTTPConfig      `yaml:"http"     env-prefix:"HTTP_"`
+	Identity  IdentityConfig  `yaml:"identity" env-prefix:"IDENTITY_"`
+	Chat      ChatConfig      `yaml:"chat"     env-prefix:"CHAT_"`
+	DeepSeek  LLMConfig       `yaml:"deepseek" env-prefix:"DEEPSEEK_"`
+	OpenAI    OpenAIConfig    `yaml:"openai"   env-prefix:"OPENAI_"`
+	Postgres  PostgresConfig  `yaml:"postgres" env-prefix:"POSTGRES_"`
+	Redis     RedisConfig     `yaml:"redis"    env-prefix:"REDIS_"`
+	Memory    MemoryConfig    `yaml:"memory"    env-prefix:"MEMORY_"`
+	Document  DocumentConfig  `yaml:"document"  env-prefix:"DOCUMENT_"`
+	Candidate CandidateConfig `yaml:"candidate" env-prefix:"CANDIDATE_"`
+	Log       LogConfig       `yaml:"log"       env-prefix:"LOG_"`
+}
+
+// CandidateConfig 控制候选内容抽取。
+// 抽取只产生「待确认」候选，因此这里全是防止提案泛滥与费用失控的预算，
+// 没有任何一项能让抽取结果直接变成正式数据。
+type CandidateConfig struct {
+	Enabled                bool   `yaml:"enabled"                  env:"ENABLED"                  env-default:"true"`
+	ExtractorModel         string `yaml:"extractor_model"          env:"EXTRACTOR_MODEL"`
+	ExtractorVersion       string `yaml:"extractor_version"        env:"EXTRACTOR_VERSION"        env-default:"candidate-extractor-v1"`
+	ExtractorPromptPath    string `yaml:"extractor_prompt_path"    env:"EXTRACTOR_PROMPT_PATH"    env-default:"prompts/candidate_extractor_v1.tmpl"`
+	ExtractTimeoutSeconds  int    `yaml:"extract_timeout_seconds"  env:"EXTRACT_TIMEOUT_SECONDS"  env-default:"60"`
+	MaxCandidates          int    `yaml:"max_candidates"           env:"MAX_CANDIDATES"           env-default:"20"`
+	MaxTitleChars          int    `yaml:"max_title_chars"          env:"MAX_TITLE_CHARS"          env-default:"120"`
+	MaxSummaryChars        int    `yaml:"max_summary_chars"        env:"MAX_SUMMARY_CHARS"        env-default:"800"`
+	MaxNoteChars           int    `yaml:"max_note_chars"           env:"MAX_NOTE_CHARS"           env-default:"500"`
+	MaxSourcesPerCandidate int    `yaml:"max_sources_per_candidate" env:"MAX_SOURCES_PER_CANDIDATE" env-default:"5"`
+	MaxChunksPerRequest    int    `yaml:"max_chunks_per_request"   env:"MAX_CHUNKS_PER_REQUEST"   env-default:"40"`
+	MaxChunkChars          int    `yaml:"max_chunk_chars"          env:"MAX_CHUNK_CHARS"          env-default:"2000"`
+}
+
+// DocumentConfig 控制 Markdown 资料上传与解析的硬上限。
+// 这些是防御性预算：一份异常文件不能变成成千上万条来源片段或超长 Prompt 上下文。
+type DocumentConfig struct {
+	MaxFileBytes  int64 `yaml:"max_file_bytes"   env:"MAX_FILE_BYTES"   env-default:"1048576"`
+	MaxTitleChars int   `yaml:"max_title_chars"  env:"MAX_TITLE_CHARS"  env-default:"200"`
+	MaxRawChars   int   `yaml:"max_raw_chars"    env:"MAX_RAW_CHARS"    env-default:"400000"`
+	MaxHeadings   int   `yaml:"max_headings"     env:"MAX_HEADINGS"     env-default:"800"`
+	MaxChunks     int   `yaml:"max_chunks"       env:"MAX_CHUNKS"       env-default:"1000"`
+	MaxChunkChars int   `yaml:"max_chunk_chars"  env:"MAX_CHUNK_CHARS"  env-default:"20000"`
 }
 
 // MemoryConfig 控制异步记忆抽取管道（Worker Pool + 补扫 + 租约 + 退避）的行为与硬上限。
@@ -140,5 +171,8 @@ func Load(path string) (*Config, error) {
 func (c *Config) resolveDerivedDefaults() {
 	if c.Memory.ExtractorModel == "" {
 		c.Memory.ExtractorModel = c.DeepSeek.Model
+	}
+	if c.Candidate.ExtractorModel == "" {
+		c.Candidate.ExtractorModel = c.DeepSeek.Model
 	}
 }

@@ -38,6 +38,18 @@ redis:
   pool_size: 50
   min_idle_conns: 5
 
+# 候选内容抽取：AI 只允许产出「待确认候选」，任何正式知识点/计划/事实都必须用户逐条确认。
+# 这里的参数只控制提案预算，调大也不会让抽取结果绕过确认。
+candidate:
+  enabled: true
+  extractor_version: "candidate-extractor-v1"
+  extractor_prompt_path: "prompts/candidate_extractor_v1.tmpl"
+  extract_timeout_seconds: 60
+  max_candidates: 20              # 单次抽取最多提案数，超出截断
+  max_sources_per_candidate: 5    # 每个候选至少 1 条来源片段，最多 5 条
+  max_chunks_per_request: 40      # 单次送入模型的片段数
+  max_chunk_chars: 2000           # 单个片段送入模型的字符上限
+
 log:
   level: "info"   # debug | info | warn | error
   # debug=true 时才允许打印敏感原文，仅限本地，线上禁止开启

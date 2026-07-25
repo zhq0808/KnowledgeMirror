@@ -23,6 +23,8 @@ type Server struct {
 	sessions       *service.SessionService
 	messages       *service.MessageService
 	turnLeases     *service.TurnLeaseService
+	documents      *service.DocumentService
+	candidates     *service.CandidateService
 	memory         memoryNotifier
 	identityConfig config.IdentityConfig
 	log            *slog.Logger
@@ -30,7 +32,7 @@ type Server struct {
 }
 
 // NewServer 构建 HTTP Server 并注册路由与中间件。memory 可为 nil（关闭异步抽取时不投递）。
-func NewServer(chat *service.ChatService, identity *service.IdentityService, sessions *service.SessionService, messages *service.MessageService, turnLeases *service.TurnLeaseService, memory memoryNotifier, identityConfig config.IdentityConfig, log *slog.Logger) *Server {
+func NewServer(chat *service.ChatService, identity *service.IdentityService, sessions *service.SessionService, messages *service.MessageService, turnLeases *service.TurnLeaseService, documents *service.DocumentService, candidates *service.CandidateService, memory memoryNotifier, identityConfig config.IdentityConfig, log *slog.Logger) *Server {
 	gin.SetMode(gin.ReleaseMode)
 	s := &Server{
 		chat:           chat,
@@ -38,6 +40,8 @@ func NewServer(chat *service.ChatService, identity *service.IdentityService, ses
 		sessions:       sessions,
 		messages:       messages,
 		turnLeases:     turnLeases,
+		documents:      documents,
+		candidates:     candidates,
 		memory:         memory,
 		identityConfig: identityConfig,
 		log:            log,
@@ -48,8 +52,12 @@ func NewServer(chat *service.ChatService, identity *service.IdentityService, ses
 }
 
 // maxBodyBytes 是默认请求体大小上限（2MB）。
-// 文本录入足够；语音/文件上传接口后续可单独放宽。
+// 文本录入足够；资料上传另有 multipart 与单文件上限，见 documentBodyLimitBytes。
 const maxBodyBytes = 2 << 20
+
+// documentBodyLimitBytes 是 Markdown 上传接口的请求体上限（4MB）。
+// 需要大于单文件上限：multipart 还带边界、字段名和其它表单项。
+const documentBodyLimitBytes = 4 << 20
 
 // routes 注册中间件与路由。
 func (s *Server) routes() {
@@ -78,6 +86,41 @@ func (s *Server) routes() {
 		protected.GET("/sessions", s.listSessionsHandler)
 		protected.GET("/sessions/:session_id/messages", s.listSessionMessagesHandler)
 		protected.POST("/chat/stream", s.chatStreamHandler)
+
+		// 资料治理：上传、解析、版本、来源片段、用途确认。
+		// 这些接口只改变资料状态，不产生知识点，也不改变任何掌握状态。
+		if s.documents != nil {
+			documents := protected.Group("/documents")
+			documents.POST("", bodyLimitMiddleware(documentBodyLimitBytes), s.uploadDocumentHandler)
+			documents.GET("", s.listDocumentsHandler)
+			documents.GET("/:document_id", s.getDocumentHandler)
+			documents.PATCH("/:document_id", s.updateDocumentHandler)
+			documents.DELETE("/:document_id", s.deleteDocumentHandler)
+			documents.POST("/:document_id/parse/retry", s.retryDocumentParseHandler)
+			documents.PUT("/:document_id/usages", s.confirmDocumentUsagesHandler)
+			documents.GET("/:document_id/versions", s.listDocumentVersionsHandler)
+			documents.GET("/:document_id/versions/:version_id", s.getDocumentVersionHandler)
+			documents.GET("/:document_id/chunks", s.listDocumentChunksHandler)
+			documents.PATCH("/:document_id/chunks/:chunk_id", s.updateDocumentChunkHandler)
+
+			// 候选内容：AI 抽取结果只能是「待确认」，正式数据必须由用户在下面的接口逐条确认。
+			if s.candidates != nil {
+				documents.POST("/:document_id/candidates/extract", s.extractDocumentCandidatesHandler)
+			}
+		}
+
+		if s.candidates != nil {
+			candidates := protected.Group("/candidates")
+			candidates.GET("", s.listCandidatesHandler)
+			candidates.GET("/:candidate_id", s.getCandidateHandler)
+			candidates.PATCH("/:candidate_id", s.updateCandidateHandler)
+			candidates.POST("/:candidate_id/confirm", s.confirmCandidateHandler)
+			candidates.POST("/:candidate_id/merge", s.mergeCandidateHandler)
+			candidates.POST("/:candidate_id/archive", s.archiveCandidateHandler)
+			candidates.POST("/:candidate_id/reject", s.rejectCandidateHandler)
+
+			protected.GET("/knowledge-points", s.listKnowledgePointsHandler)
+		}
 	}
 }
 

@@ -96,6 +96,56 @@ func run() error {
 	messageService := service.NewMessageService(messageRepository)
 	turnLeaseRepository := store.NewPostgresTurnLeaseRepository(db)
 	turnLeaseService := service.NewTurnLeaseService(turnLeaseRepository)
+	documentRepository := store.NewPostgresDocumentRepository(db)
+	documentService := service.NewDocumentService(documentRepository, service.DocumentLimits{
+		MaxFileBytes:  cfg.Document.MaxFileBytes,
+		MaxTitleChars: cfg.Document.MaxTitleChars,
+		Parse: service.MarkdownParseLimits{
+			MaxRawChars:   cfg.Document.MaxRawChars,
+			MaxHeadings:   cfg.Document.MaxHeadings,
+			MaxChunks:     cfg.Document.MaxChunks,
+			MaxChunkChars: cfg.Document.MaxChunkChars,
+		},
+	})
+	// 候选内容抽取：AI 只提案，正式知识点/计划/事实必须由用户在候选确认接口逐条确认。
+	// 未启用或未配置模型时，抽取接口返回“未启用”，但人工确认链路照常可用。
+	var candidateService *service.CandidateService
+	if cfg.Candidate.Enabled {
+		candidateClient := llm.NewDeepSeekClient(
+			cfg.DeepSeek.APIKey,
+			cfg.DeepSeek.BaseURL,
+			cfg.Candidate.ExtractorModel,
+			0,
+			time.Duration(cfg.Candidate.ExtractTimeoutSeconds)*time.Second,
+		)
+		candidateExtractor, err := service.LoadLLMCandidateExtractor(
+			cfg.Candidate.ExtractorPromptPath,
+			cfg.Candidate.ExtractorVersion,
+			cfg.Candidate.ExtractorModel,
+			candidateClient,
+		)
+		if err != nil {
+			return err
+		}
+		candidateService = service.NewCandidateService(
+			store.NewPostgresCandidateRepository(db),
+			documentService,
+			candidateExtractor,
+			service.CandidateLimits{
+				MaxCandidates:          cfg.Candidate.MaxCandidates,
+				MaxTitleChars:          cfg.Candidate.MaxTitleChars,
+				MaxSummaryChars:        cfg.Candidate.MaxSummaryChars,
+				MaxNoteChars:           cfg.Candidate.MaxNoteChars,
+				MaxSourcesPerCandidate: cfg.Candidate.MaxSourcesPerCandidate,
+				MaxChunksPerRequest:    cfg.Candidate.MaxChunksPerRequest,
+				MaxChunkChars:          cfg.Candidate.MaxChunkChars,
+			},
+		)
+		log.Info("候选内容抽取已启用", "prompt_version", cfg.Candidate.ExtractorVersion, "model", cfg.Candidate.ExtractorModel)
+	} else {
+		log.Info("候选内容抽取未启用（CANDIDATE_ENABLED=false）")
+	}
+
 	memoryRepository := store.NewPostgresMemoryRepository(db)
 	memoryService := service.NewMemoryService(memoryRepository, service.MemoryExtractionLimits{
 		MaxOperations:       cfg.Memory.MaxOperations,
@@ -146,7 +196,7 @@ func run() error {
 		log.Info("记忆抽取管道未启用（MEMORY_ENABLED=false）")
 	}
 
-	srvHandler := handler.NewServer(chatService, identityService, sessionService, messageService, turnLeaseService, memoryPipeline, cfg.Identity, log).Handler()
+	srvHandler := handler.NewServer(chatService, identityService, sessionService, messageService, turnLeaseService, documentService, candidateService, memoryPipeline, cfg.Identity, log).Handler()
 	srv := &http.Server{
 		Addr:              ":" + cfg.HTTP.Port,
 		Handler:           srvHandler,
