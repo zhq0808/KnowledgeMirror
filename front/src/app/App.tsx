@@ -31,6 +31,7 @@ import {
   rememberModelID,
   type SessionListItem,
   type SessionMessage,
+  type RetrievalSources,
 } from "./api/chat";
 import { AuthPage } from "./pages/AuthPage";
 
@@ -53,6 +54,7 @@ interface Message {
   // retry 保存失败发送的原始负载：重试时复用同一 client_message_id 命中后端幂等，
   // 避免重复计费/重复落库；只有全新发送才生成新的 UUID。
   retry?: { clientMessageID: string; text: string };
+  retrieval?: RetrievalSources;
 }
 
 interface ActionItem {
@@ -126,6 +128,7 @@ function mapBackendMessages(items: SessionMessage[]): Message[] {
     id: `srv-${item.message_id}`,
     type: item.role === "assistant" ? "ai" : "user",
     content: item.content,
+    retrieval: item.retrieval,
     time: formatClock(new Date(item.created_at)),
   }));
 }
@@ -375,6 +378,13 @@ function InterviewWorkspace() {
             )
           );
         },
+        (retrieval) => {
+          setMessages((prev) =>
+            prev.map((message) =>
+              message.id === targetId ? { ...message, retrieval } : message
+            )
+          );
+        },
         controller.signal
       );
       // 回复完成后刷新会话列表，更新消息数与最近活跃时间。
@@ -619,6 +629,7 @@ function InterviewWorkspace() {
                       message={message.content}
                       time={resolveTime(message)}
                       failed={message.failed}
+                      retrieval={message.retrieval}
                       onRetry={
                         message.failed
                           ? () => handleRetryMessage(message.id)

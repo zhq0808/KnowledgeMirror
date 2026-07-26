@@ -35,8 +35,8 @@ export default defineConfig({
   },
 
   server: {
-    // 显式绑 IPv4，否则 Vite 默认只监听 ::1(IPv6)，Windows 上 127.0.0.1 会连接被拒
-    host: '127.0.0.1',
+    // 绑 0.0.0.0：同时覆盖 127.0.0.1 和局域网 IP，手机可通过 http://<本机IP>:5173 访问
+    host: '0.0.0.0',
     port: 5173,
     strictPort: true,
     // 开发时把后端请求透传到 Go 服务(8091)，前端直接调 /api、/health 即可，免跨域

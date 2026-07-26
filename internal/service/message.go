@@ -40,12 +40,13 @@ type AppendUserMessageResult struct {
 // AppendAssistantMessageRequest 是写入完整模型回复所需的可信数据。
 // ParentMessageID 指向本轮 user 消息的 message_id（UUID），为空表示无父消息。
 type AppendAssistantMessageRequest struct {
-	UserID          string
-	SessionID       string
-	ParentMessageID string
-	Content         string
-	PromptVersion   string
-	ModelName       string
+	UserID             string
+	SessionID          string
+	ParentMessageID    string
+	Content            string
+	PromptVersion      string
+	ModelName          string
+	RetrievalRequestID string
 }
 
 // AssistantMessage 是已持久化的模型回复。MessageID 是后端生成的 UUIDv7 业务身份。
@@ -55,7 +56,29 @@ type AssistantMessage struct {
 	SessionID string
 	Seq       int64
 	Content   string
+	Retrieval *MessageRetrieval
 	CreatedAt time.Time
+}
+
+// SessionRetrievalSource 是历史消息可恢复的结构化资料引用，不包含资料正文。
+type SessionRetrievalSource struct {
+	Ref           string
+	SourceChunkID string
+	DocumentID    string
+	DocumentTitle string
+	VersionNo     int
+	HeadingPath   []string
+	OriginLabel   string
+	TrustLabel    string
+	Truncated     bool
+}
+
+type MessageRetrieval struct {
+	RequestID        string
+	Status           string
+	CandidateCount   int
+	QuarantinedCount int
+	Sources          []SessionRetrievalSource
 }
 
 // ConversationMessage 是可进入对话上下文的已完成消息。
@@ -72,6 +95,7 @@ type SessionMessage struct {
 	Role      string
 	Content   string
 	Seq       int64
+	Retrieval *MessageRetrieval
 	CreatedAt time.Time
 }
 

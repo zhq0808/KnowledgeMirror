@@ -47,11 +47,30 @@ type ChatMemoryReader interface {
 	ListCurrentMemories(ctx context.Context, userID string, budget MemoryBudget) ([]Memory, error)
 }
 
+// ChatRetriever 提供已授权资料的检索能力。nil 表示未启用知识库检索。
+type ChatRetriever interface {
+	Retrieve(ctx context.Context, query RetrievalQuery) (RetrievalResult, error)
+}
+
+// ChatStreamRequest 是一次流式对话所需的全部输入与回调。
+// 用结构体而不是一长串参数，是因为检索还需要 SessionID/TraceID 做审计，
+// 且引用列表要在首个内容增量之前先回传给接口层。
+type ChatStreamRequest struct {
+	UserID    string
+	SessionID string
+	TraceID   string
+	History   []ConversationMessage
+	// OnRetrieval 在模型调用前被调一次，供接口层先下发引用来源；可为 nil。
+	OnRetrieval func(result RetrievalResult) error
+	OnDelta     func(delta string) error
+}
+
 // ChatService 编排聊天上下文和模型调用。
 type ChatService struct {
 	model         ChatModel
 	prompt        *ChatPrompt
 	memories      ChatMemoryReader
+	retrieval     ChatRetriever
 	memoryBudget  MemoryBudget
 	maxReplyChars int
 }
@@ -70,6 +89,14 @@ func NewChatService(model ChatModel, prompt *ChatPrompt, memories ChatMemoryRead
 	}
 }
 
+// WithRetrieval 在组装根注入知识库检索。
+// 作为可选能力单独挂载，而不是再往构造函数加一个参数：
+// 未注入时聊天链路照常可用，只是不带资料引用。
+func (s *ChatService) WithRetrieval(retrieval ChatRetriever) *ChatService {
+	s.retrieval = retrieval
+	return s
+}
+
 func (s *ChatService) Timeout() time.Duration {
 	return s.model.Timeout()
 }
@@ -84,22 +111,26 @@ func (s *ChatService) ModelName() string {
 
 // Stream 组装 system prompt 和服务端读取的可信会话历史，流式调用模型，并把完整回复内容攒好返回。
 //
-// onDelta 只负责把每段增量转发给调用方（handler 再转成 SSE 帧），不承担任何累积/截断逻辑——
+// OnDelta 只负责把每段增量转发给调用方（handler 再转成 SSE 帧），不承担任何累积/截断逻辑——
 // 这些属于业务规则，由 service 统一负责，避免 handler 里堆业务判断。
 // 达到 maxReplyChars 上限时，附加一段截断提示后正常收尾（返回 nil error），
 // 因为客户端已经看到了前面这部分内容，不应该被当作一次调用失败。
-func (s *ChatService) Stream(ctx context.Context, userID string, history []ConversationMessage, onDelta func(delta string) error) (string, error) {
-	userFactSummary, err := s.loadUserFactSummary(ctx, userID)
+func (s *ChatService) Stream(ctx context.Context, request ChatStreamRequest) (string, error) {
+	userFactSummary, err := s.loadUserFactSummary(ctx, request.UserID)
 	if err != nil {
 		return "", fmt.Errorf("加载用户记忆失败: %w", err)
 	}
-	systemPrompt, err := s.prompt.Render(userFactSummary)
+	retrievedContext, err := s.loadRetrievedContext(ctx, request)
+	if err != nil {
+		return "", err
+	}
+	systemPrompt, err := s.prompt.Render(userFactSummary, retrievedContext)
 	if err != nil {
 		return "", fmt.Errorf("构建 system prompt 失败: %w", err)
 	}
-	messages := make([]llm.Message, 0, len(history)+1)
+	messages := make([]llm.Message, 0, len(request.History)+1)
 	messages = append(messages, llm.Message{Role: "system", Content: systemPrompt})
-	for _, message := range history {
+	for _, message := range request.History {
 		messages = append(messages, llm.Message{Role: message.Role, Content: message.Content})
 	}
 
@@ -114,7 +145,7 @@ func (s *ChatService) Stream(ctx context.Context, userID string, history []Conve
 				allowed := string(deltaRunes[:remaining])
 				content = append(content, allowed...)
 				charCount += remaining
-				if err := onDelta(allowed); err != nil {
+				if err := request.OnDelta(allowed); err != nil {
 					return err
 				}
 			}
@@ -123,7 +154,7 @@ func (s *ChatService) Stream(ctx context.Context, userID string, history []Conve
 		}
 		content = append(content, delta...)
 		charCount += len(deltaRunes)
-		return onDelta(delta)
+		return request.OnDelta(delta)
 	})
 	if errors.Is(err, errReplyTruncated) {
 		err = nil
@@ -132,12 +163,65 @@ func (s *ChatService) Stream(ctx context.Context, userID string, history []Conve
 		return string(content), err
 	}
 	if truncated {
-		if notifyErr := onDelta(truncationNotice); notifyErr != nil {
+		if notifyErr := request.OnDelta(truncationNotice); notifyErr != nil {
 			return string(content), notifyErr
 		}
 		content = append(content, truncationNotice...)
 	}
 	return string(content), nil
+}
+
+// loadRetrievedContext 执行知识库检索并返回可直接进入 Prompt 的受控数据块。
+//
+// 检索是增强能力而不是对话的必要条件，所以故障时降级继续对话；
+// 但降级绝不能静默——必须把“本轮没用资料”写进上下文，否则模型会照常编造引用。
+func (s *ChatService) loadRetrievedContext(ctx context.Context, request ChatStreamRequest) (string, error) {
+	if s.retrieval == nil {
+		return retrievalDisabledNotice, nil
+	}
+	query := latestUserMessage(request.History)
+	if query == "" {
+		return retrievalDisabledNotice, nil
+	}
+
+	result, err := s.retrieval.Retrieve(ctx, RetrievalQuery{
+		UserID:    request.UserID,
+		SessionID: request.SessionID,
+		TraceID:   request.TraceID,
+		Query:     query,
+		Purpose:   DocumentPurposeAIRetrieval,
+	})
+	if err != nil {
+		// 输入类错误（例如提问过长）不应该把整轮对话拖坠，一律按降级处理。
+		block := result.ContextBlock
+		if strings.TrimSpace(block) == "" {
+			block = retrievalFailedNotice
+		}
+		if request.OnRetrieval != nil {
+			result.Status = RetrievalStatusFailed
+			if callbackErr := request.OnRetrieval(result); callbackErr != nil {
+				return "", callbackErr
+			}
+		}
+		return block, nil
+	}
+
+	if request.OnRetrieval != nil {
+		if err := request.OnRetrieval(result); err != nil {
+			return "", err
+		}
+	}
+	return result.ContextBlock, nil
+}
+
+// latestUserMessage 取历史里最后一条用户消息作为检索查询。
+func latestUserMessage(history []ConversationMessage) string {
+	for index := len(history) - 1; index >= 0; index-- {
+		if history[index].Role == "user" {
+			return strings.TrimSpace(history[index].Content)
+		}
+	}
+	return ""
 }
 
 func (s *ChatService) loadUserFactSummary(ctx context.Context, userID string) (string, error) {

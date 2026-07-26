@@ -33,7 +33,28 @@ export interface SessionMessage {
   role: string;
   content: string;
   seq: number;
+  retrieval?: RetrievalSources;
   created_at: string;
+}
+
+export interface RetrievalSource {
+  ref: string;
+  source_chunk_id: string;
+  document_id: string;
+  document_title: string;
+  version_no: number;
+  heading_path: string[];
+  origin_label: string;
+  trust_label: string;
+  truncated: boolean;
+}
+
+export interface RetrievalSources {
+  request_id?: string;
+  status: string;
+  candidate_count: number;
+  sources: RetrievalSource[];
+  quarantined_count: number;
 }
 
 const sessionIDKey = "interview_agent_session_id_v1";
@@ -153,6 +174,7 @@ interface SSEFrame {
   event: string;
   delta?: string;
   message?: string;
+  sources?: RetrievalSources;
 }
 
 // parseFrame 解析单个 SSE 帧（形如 "event: xxx\ndata: {json}"）。
@@ -165,7 +187,12 @@ function parseFrame(frame: string): SSEFrame {
   }
   try {
     const obj = JSON.parse(data || "{}");
-    return { event, delta: obj.delta, message: obj.message };
+    return {
+      event,
+      delta: obj.delta,
+      message: obj.message,
+      sources: event === "sources" ? (obj as RetrievalSources) : undefined,
+    };
   } catch {
     return { event };
   }
@@ -179,6 +206,7 @@ export async function sendChatStream(
   clientMessageID: string,
   message: string,
   onDelta: (delta: string) => void,
+  onSources: (sources: RetrievalSources) => void,
   signal?: AbortSignal
 ): Promise<void> {
   const res = await fetch("/api/v1/chat/stream", {
@@ -213,9 +241,13 @@ export async function sendChatStream(
       const frame = buffer.slice(0, idx);
       buffer = buffer.slice(idx + 2);
 
-      const { event, delta, message: errMsg } = parseFrame(frame);
+      const { event, delta, message: errMsg, sources } = parseFrame(frame);
       if (event === "error") throw new Error(errMsg || "对话失败");
       if (event === "done") return;
+      if (event === "sources" && sources) {
+        onSources(sources);
+        continue;
+      }
       if (delta) onDelta(delta);
     }
   }

@@ -19,7 +19,22 @@ type Config struct {
 	Memory    MemoryConfig    `yaml:"memory"    env-prefix:"MEMORY_"`
 	Document  DocumentConfig  `yaml:"document"  env-prefix:"DOCUMENT_"`
 	Candidate CandidateConfig `yaml:"candidate" env-prefix:"CANDIDATE_"`
+	Retrieval RetrievalConfig `yaml:"retrieval" env-prefix:"RETRIEVAL_"`
 	Log       LogConfig       `yaml:"log"       env-prefix:"LOG_"`
+}
+
+// RetrievalConfig 控制 Agent 知识库检索 v0。
+// 这里全是防御性预算：调大也不会让未授权资料被召回，
+// 只会影响一次回答能用多少已授权原文。
+type RetrievalConfig struct {
+	Enabled                bool `yaml:"enabled"                   env:"ENABLED"                   env-default:"true"`
+	MaxQueryChars          int  `yaml:"max_query_chars"           env:"MAX_QUERY_CHARS"           env-default:"500"`
+	MaxTerms               int  `yaml:"max_terms"                 env:"MAX_TERMS"                 env-default:"12"`
+	MaxCandidates          int  `yaml:"max_candidates"            env:"MAX_CANDIDATES"            env-default:"50"`
+	MaxResults             int  `yaml:"max_results"               env:"MAX_RESULTS"               env-default:"6"`
+	MaxPassagesPerDocument int  `yaml:"max_passages_per_document" env:"MAX_PASSAGES_PER_DOCUMENT" env-default:"2"`
+	MaxChunkChars          int  `yaml:"max_chunk_chars"           env:"MAX_CHUNK_CHARS"           env-default:"1200"`
+	ContextBudgetChars     int  `yaml:"context_budget_chars"      env:"CONTEXT_BUDGET_CHARS"      env-default:"4000"`
 }
 
 // CandidateConfig 控制候选内容抽取。

@@ -16,7 +16,7 @@ func TestInterviewChatPromptEnforcesEvidenceBasedTraining(t *testing.T) {
 		t.Fatalf("LoadChatPrompt() error = %v", err)
 	}
 
-	rendered, err := prompt.Render("目标岗位：Go 后端；已确认生产经历：Kafka 消费者开发")
+	rendered, err := prompt.Render("目标岗位：Go 后端；已确认生产经历：Kafka 消费者开发", "")
 	if err != nil {
 		t.Fatalf("Render() error = %v", err)
 	}

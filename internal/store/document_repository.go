@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -435,7 +436,32 @@ func (r *PostgresDocumentRepository) GetVersionRawText(ctx context.Context, user
 }
 
 func (r *PostgresDocumentRepository) ListDocuments(ctx context.Context, userID string, limit int) ([]service.DocumentListItem, error) {
-	rows, err := r.pool.Query(ctx, documentSelectSQL+`
+	rows, err := r.pool.Query(ctx, `
+		SELECT d.document_id::text, d.user_id, d.title, d.content_origin, d.document_kind,
+		       d.status, COALESCE(d.current_version_id::text, ''), COALESCE(d.parse_error, ''),
+		       d.parsed_at, d.created_at, d.updated_at,
+		       v.version_id::text, v.document_id::text, v.version_no, v.original_filename,
+		       v.mime_type, v.size_bytes, v.sha256, v.parser_version, v.created_at,
+		       COALESCE((
+		           SELECT json_agg(json_build_object(
+		               'purpose', u.purpose,
+		               'enabled', u.enabled,
+		               'confirmed_at', u.confirmed_at
+		           ) ORDER BY u.purpose)::text
+		           FROM document_usages AS u
+		           WHERE u.document_version_id = d.current_version_id
+		             AND u.user_id = d.user_id
+		             AND u.enabled
+		       ), '[]'),
+		       (SELECT COUNT(*)
+		        FROM source_chunks AS c
+		        WHERE c.document_version_id = d.current_version_id
+		          AND c.user_id = d.user_id)
+		FROM documents AS d
+		JOIN document_versions AS v
+		  ON v.version_id = d.current_version_id
+		 AND v.document_id = d.document_id
+		 AND v.user_id = d.user_id
 		WHERE d.user_id = $1
 		  AND d.deleted_at IS NULL
 		ORDER BY d.updated_at DESC, d.document_id DESC
@@ -443,41 +469,43 @@ func (r *PostgresDocumentRepository) ListDocuments(ctx context.Context, userID s
 	if err != nil {
 		return nil, fmt.Errorf("查询资料列表失败: %w", err)
 	}
-	documents := make([]service.Document, 0, limit)
+	defer rows.Close()
+	items := make([]service.DocumentListItem, 0, limit)
 	for rows.Next() {
-		document, err := scanDocument(rows)
-		if err != nil {
-			rows.Close()
-			return nil, err
+		var item service.DocumentListItem
+		var digest []byte
+		var usagesJSON string
+		if err := rows.Scan(
+			&item.Document.DocumentID, &item.Document.UserID, &item.Document.Title,
+			&item.Document.ContentOrigin, &item.Document.DocumentKind, &item.Document.Status,
+			&item.Document.CurrentVersionID, &item.Document.ParseError, &item.Document.ParsedAt,
+			&item.Document.CreatedAt, &item.Document.UpdatedAt,
+			&item.Version.VersionID, &item.Version.DocumentID, &item.Version.VersionNo,
+			&item.Version.OriginalFilename, &item.Version.MIMEType, &item.Version.SizeBytes,
+			&digest, &item.Version.ParserVersion, &item.Version.CreatedAt,
+			&usagesJSON, &item.ChunkCount,
+		); err != nil {
+			return nil, fmt.Errorf("扫描资料列表失败: %w", err)
 		}
-		documents = append(documents, document)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("遍历资料列表失败: %w", err)
-	}
-
-	items := make([]service.DocumentListItem, 0, len(documents))
-	for _, document := range documents {
-		item := service.DocumentListItem{Document: document}
-		if document.CurrentVersionID != "" {
-			version, err := scanVersion(r.pool.QueryRow(ctx, versionSelectSQL+`
-				WHERE version_id = $1
-				  AND user_id = $2`, document.CurrentVersionID, userID))
-			if err != nil {
-				return nil, err
-			}
-			usages, err := r.listUsages(ctx, userID, document.CurrentVersionID)
-			if err != nil {
-				return nil, err
-			}
-			chunkCount, err := r.countChunks(ctx, userID, document.CurrentVersionID)
-			if err != nil {
-				return nil, err
-			}
-			item.Version, item.Usages, item.ChunkCount = version, usages, chunkCount
+		item.Version.SHA256Hex = hex.EncodeToString(digest)
+		var usages []struct {
+			Purpose     string     `json:"purpose"`
+			Enabled     bool       `json:"enabled"`
+			ConfirmedAt *time.Time `json:"confirmed_at"`
+		}
+		if err := json.Unmarshal([]byte(usagesJSON), &usages); err != nil {
+			return nil, fmt.Errorf("解析资料用途失败: %w", err)
+		}
+		item.Usages = make([]service.DocumentUsage, 0, len(usages))
+		for _, usage := range usages {
+			item.Usages = append(item.Usages, service.DocumentUsage{
+				Purpose: usage.Purpose, Enabled: usage.Enabled, ConfirmedAt: usage.ConfirmedAt,
+			})
 		}
 		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历资料列表失败: %w", err)
 	}
 	return items, nil
 }
@@ -600,23 +628,32 @@ func (r *PostgresDocumentRepository) countChunks(ctx context.Context, userID, ve
 // ---------------------------------------------------------------------------
 
 func (r *PostgresDocumentRepository) UpdateDocumentMetadata(ctx context.Context, params service.UpdateDocumentMetadataParams) error {
-	command, err := r.pool.Exec(ctx, `
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("开启资料元数据事务失败: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := lockCurrentDocumentVersion(ctx, tx, params.UserID, params.DocumentID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
 		UPDATE documents
 		SET title = COALESCE($1, title),
 		    content_origin = COALESCE($2, content_origin),
 		    document_kind = COALESCE($3, document_kind),
-		    status = $4,
-		    updated_by = $5
-		WHERE document_id = $6
-		  AND user_id = $5
+		    updated_by = $4
+		WHERE document_id = $5
+		  AND user_id = $4
 		  AND deleted_at IS NULL`,
-		params.Title, params.ContentOrigin, params.DocumentKind,
-		params.Status, params.UserID, params.DocumentID)
-	if err != nil {
+		params.Title, params.ContentOrigin, params.DocumentKind, params.UserID, params.DocumentID); err != nil {
 		return fmt.Errorf("更新资料元数据失败: %w", err)
 	}
-	if command.RowsAffected() == 0 {
-		return service.ErrDocumentNotFound
+	if err := recomputeDocumentStatus(ctx, tx, params.UserID, params.DocumentID, true); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("提交资料元数据事务失败: %w", err)
 	}
 	return nil
 }
@@ -634,6 +671,22 @@ func (r *PostgresDocumentRepository) ReplaceDocumentUsages(ctx context.Context, 
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	versionID, err := lockCurrentDocumentVersion(ctx, tx, params.UserID, params.DocumentID)
+	if err != nil {
+		return err
+	}
+	var chunkCount int
+	if err := tx.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM source_chunks
+		WHERE document_version_id = $1
+		  AND user_id = $2`, versionID, params.UserID).Scan(&chunkCount); err != nil {
+		return fmt.Errorf("统计当前版本来源片段失败: %w", err)
+	}
+	if chunkCount == 0 {
+		return &service.DocumentInputError{Message: "资料尚未解析成功，无法确认用途"}
+	}
+
 	if _, err := tx.Exec(ctx, `
 		UPDATE document_usages
 		SET enabled = FALSE,
@@ -643,7 +696,7 @@ func (r *PostgresDocumentRepository) ReplaceDocumentUsages(ctx context.Context, 
 		WHERE document_version_id = $3
 		  AND user_id = $1
 		  AND NOT (purpose = ANY($4::text[]))`,
-		params.UserID, params.ConfirmedAt, params.VersionID, params.Purposes); err != nil {
+		params.UserID, params.ConfirmedAt, versionID, params.Purposes); err != nil {
 		return fmt.Errorf("关闭资料用途失败: %w", err)
 	}
 
@@ -663,7 +716,7 @@ func (r *PostgresDocumentRepository) ReplaceDocumentUsages(ctx context.Context, 
 			    confirmed_by = EXCLUDED.confirmed_by,
 			    confirmed_at = EXCLUDED.confirmed_at,
 			    updated_by = EXCLUDED.updated_by`,
-			usageID, params.VersionID, params.DocumentID, params.UserID, purpose, params.ConfirmedAt); err != nil {
+			usageID, versionID, params.DocumentID, params.UserID, purpose, params.ConfirmedAt); err != nil {
 			return fmt.Errorf("确认资料用途失败: %w", err)
 		}
 	}
@@ -682,26 +735,72 @@ func (r *PostgresDocumentRepository) ReplaceDocumentUsages(ctx context.Context, 
 		WHERE document_version_id = $3
 		  AND user_id = $2
 		  AND retrieval_enabled <> $1`,
-		retrievalEnabled, params.UserID, params.VersionID); err != nil {
+		retrievalEnabled, params.UserID, versionID); err != nil {
 		return fmt.Errorf("同步来源片段检索开关失败: %w", err)
 	}
 
-	command, err := tx.Exec(ctx, `
-		UPDATE documents
-		SET status = $1,
-		    updated_by = $2
-		WHERE document_id = $3
-		  AND user_id = $2
-		  AND deleted_at IS NULL`, params.Status, params.UserID, params.DocumentID)
-	if err != nil {
-		return fmt.Errorf("更新资料状态失败: %w", err)
-	}
-	if command.RowsAffected() == 0 {
-		return service.ErrDocumentNotFound
+	if err := recomputeDocumentStatus(ctx, tx, params.UserID, params.DocumentID, false); err != nil {
+		return err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("提交资料用途事务失败: %w", err)
+	}
+	return nil
+}
+
+// lockCurrentDocumentVersion 串行化同一资料的版本、元数据和用途变更。
+func lockCurrentDocumentVersion(ctx context.Context, tx pgx.Tx, userID, documentID string) (string, error) {
+	var versionID string
+	err := tx.QueryRow(ctx, `
+		SELECT current_version_id::text
+		FROM documents
+		WHERE document_id = $1
+		  AND user_id = $2
+		  AND deleted_at IS NULL
+		FOR UPDATE`, documentID, userID).Scan(&versionID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", service.ErrDocumentNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("锁定资料失败: %w", err)
+	}
+	return versionID, nil
+}
+
+// recomputeDocumentStatus 只从当前版本的数据库事实推导状态。
+// 元数据编辑不应把解析失败资料改回 parsing，重试解析仍是 failed 的唯一出口。
+func recomputeDocumentStatus(ctx context.Context, tx pgx.Tx, userID, documentID string, preserveFailed bool) error {
+	command, err := tx.Exec(ctx, `
+		UPDATE documents AS d
+		SET status = CASE
+		        WHEN $3 AND d.status = 'failed' THEN 'failed'
+		        WHEN NOT EXISTS (
+		            SELECT 1 FROM source_chunks AS c
+		            WHERE c.document_version_id = d.current_version_id AND c.user_id = d.user_id
+		        ) THEN 'parsing'
+		        WHEN EXISTS (
+		            SELECT 1 FROM document_usages AS u
+		            WHERE u.document_version_id = d.current_version_id
+		              AND u.user_id = d.user_id
+		              AND u.purpose = 'archive_only' AND u.enabled
+		        ) THEN 'archived'
+		        WHEN d.content_origin = 'pending_confirmation' OR NOT EXISTS (
+		            SELECT 1 FROM document_usages AS u
+		            WHERE u.document_version_id = d.current_version_id
+		              AND u.user_id = d.user_id AND u.enabled
+		        ) THEN 'pending_confirmation'
+		        ELSE 'ready'
+		    END,
+		    updated_by = $1
+		WHERE d.document_id = $2
+		  AND d.user_id = $1
+		  AND d.deleted_at IS NULL`, userID, documentID, preserveFailed)
+	if err != nil {
+		return fmt.Errorf("重算资料状态失败: %w", err)
+	}
+	if command.RowsAffected() == 0 {
+		return service.ErrDocumentNotFound
 	}
 	return nil
 }

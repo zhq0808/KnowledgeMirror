@@ -104,6 +104,14 @@ type handlerChatModel struct {
 	noDelta   bool // 模拟模型什么都没产出就正常结束（空回复），不调用 onDelta。
 }
 
+type handlerChatRetriever struct {
+	result service.RetrievalResult
+}
+
+func (r *handlerChatRetriever) Retrieve(_ context.Context, _ service.RetrievalQuery) (service.RetrievalResult, error) {
+	return r.result, nil
+}
+
 func (m *handlerChatModel) Timeout() time.Duration {
 	return time.Second
 }
@@ -181,6 +189,41 @@ func TestChatStreamHandlerBeginsAndCompletesTurnAroundModelCall(t *testing.T) {
 	}
 }
 
+func TestChatStreamHandlerSendsSourcesBeforeFirstDeltaAndPersistsRequestID(t *testing.T) {
+	messageRepository := &handlerMessageRepository{
+		history: []service.ConversationMessage{{Seq: 1, Role: "user", Content: "outbox"}},
+	}
+	chatModel := &handlerChatModel{}
+	turnLeaseRepository := &handlerTurnLeaseRepository{acquireResult: service.AcquireTurnLeaseResult{Acquired: true}}
+	server := newChatHandlerTestServerWithLease(messageRepository, chatModel, turnLeaseRepository)
+	server.chat.WithRetrieval(&handlerChatRetriever{result: service.RetrievalResult{
+		RequestID:      "01900000-0000-7000-8000-000000000999",
+		Status:         service.RetrievalStatusOK,
+		CandidateCount: 1,
+		ContextBlock:   "受控资料块",
+		Passages: []service.RetrievalPassage{{
+			Ref: "S1", SourceChunkID: "chunk-1", DocumentID: "doc-1",
+			DocumentTitle: "Outbox 笔记", VersionNo: 2,
+		}},
+	}})
+
+	recorder := performChatRequest(server, `{
+		"session_id":"session_0123456789abcdef0123456789abcdef",
+		"client_message_id":"550e8400-e29b-41d4-a716-446655440000",
+		"message":"outbox"
+	}`)
+
+	body := recorder.Body.String()
+	sourcesIndex := strings.Index(body, "event: sources")
+	deltaIndex := strings.Index(body, `data: {"delta":"reply"}`)
+	if sourcesIndex < 0 || deltaIndex < 0 || sourcesIndex >= deltaIndex {
+		t.Fatalf("body = %q, want sources before first delta", body)
+	}
+	if turnLeaseRepository.lastComplete.RetrievalRequestID != "01900000-0000-7000-8000-000000000999" {
+		t.Fatalf("retrieval request id = %q, want persisted request id", turnLeaseRepository.lastComplete.RetrievalRequestID)
+	}
+}
+
 // 结果恢复协议：同一条 client_message_id 重复提交，且对应的 turn 之前已经 completed，
 // 必须原样回放当年落库的 assistant 回复，绝不重新调用模型。
 func TestChatStreamHandlerReplaysCompletedReplyForIdempotentRetryWithoutCallingModel(t *testing.T) {
@@ -189,7 +232,17 @@ func TestChatStreamHandlerReplaysCompletedReplyForIdempotentRetryWithoutCallingM
 			Message: service.UserMessage{MessageID: "um-42", Seq: 3, Content: "hello"},
 			Created: false,
 		},
-		reply:      service.AssistantMessage{Content: "previous reply"},
+		reply: service.AssistantMessage{
+			Content: "previous reply",
+			Retrieval: &service.MessageRetrieval{
+				RequestID:      "01900000-0000-7000-8000-000000000999",
+				Status:         service.RetrievalStatusOK,
+				CandidateCount: 1,
+				Sources: []service.SessionRetrievalSource{{
+					Ref: "S1", SourceChunkID: "chunk-1", DocumentTitle: "Outbox 笔记", VersionNo: 2,
+				}},
+			},
+		},
 		replyFound: true,
 	}
 	chatModel := &handlerChatModel{}
@@ -221,6 +274,10 @@ func TestChatStreamHandlerReplaysCompletedReplyForIdempotentRetryWithoutCallingM
 	}
 	if !strings.Contains(recorder.Body.String(), "previous reply") {
 		t.Fatalf("body = %q, want the previously persisted reply replayed verbatim", recorder.Body.String())
+	}
+	body := recorder.Body.String()
+	if sourcesIndex, deltaIndex := strings.Index(body, "event: sources"), strings.Index(body, "previous reply"); sourcesIndex < 0 || deltaIndex < 0 || sourcesIndex >= deltaIndex || !strings.Contains(body, "01900000-0000-7000-8000-000000000999") {
+		t.Fatalf("body = %q, want persisted sources before replayed reply", body)
 	}
 	if !strings.Contains(recorder.Body.String(), "event: done") {
 		t.Fatalf("body = %q, want done event", recorder.Body.String())
@@ -547,7 +604,7 @@ func newChatHandlerTestServerWithLease(messageRepository service.MessageReposito
 		"session_0123456789abcdef0123456789abcdef": "usr_owner",
 	}}
 	prompt, err := service.ParseChatPrompt(
-		"版本={{.Version}} 边界={{.TrustBoundary}} 事实={{.UserFactSummary}}",
+		"版本={{.Version}} 边界={{.TrustBoundary}} 事实={{.UserFactSummary}} 资料={{.RetrievedContext}}",
 		"handler-test-v2",
 		"测试安全边界",
 	)

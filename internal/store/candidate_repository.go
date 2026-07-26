@@ -355,7 +355,7 @@ func (r *PostgresCandidateRepository) ResolveCandidate(ctx context.Context, para
 		}
 	}
 	command, err := r.pool.Exec(ctx, `
-		UPDATE content_candidates
+		UPDATE content_candidates AS candidate
 		SET status = $1,
 		    confirmed_outcome = $2,
 		    trust_level = $3,
@@ -367,16 +367,51 @@ func (r *PostgresCandidateRepository) ResolveCandidate(ctx context.Context, para
 		    updated_by = $7
 		WHERE candidate_id = $9
 		  AND user_id = $7
-		  AND status = 'pending'`,
+		  AND status = 'pending'
+		  AND (
+		      NULLIF($4, '') IS NULL
+		      OR EXISTS (
+		          SELECT 1
+		          FROM content_candidates AS target
+		          WHERE target.candidate_id = NULLIF($4, '')::uuid
+		            AND target.user_id = $7
+		            AND target.status = 'pending'
+		            AND target.candidate_type = candidate.candidate_type
+		      )
+		  )`,
 		params.Status, params.Outcome, params.TrustLevel, params.MergedIntoCandidateID,
 		params.DecisionNote, encoded, params.UserID, params.ResolvedAt, params.CandidateID)
 	if err != nil {
 		return service.ContentCandidate{}, fmt.Errorf("处理候选内容失败: %w", err)
 	}
 	if command.RowsAffected() == 0 {
-		return service.ContentCandidate{}, r.explainMissingPending(ctx, params.UserID, params.CandidateID)
+		return service.ContentCandidate{}, r.explainResolveFailure(ctx, params)
 	}
 	return r.GetCandidate(ctx, params.UserID, params.CandidateID)
+}
+
+func (r *PostgresCandidateRepository) explainResolveFailure(ctx context.Context, params service.ResolveCandidateParams) error {
+	var sourceStatus string
+	err := r.pool.QueryRow(ctx, `
+		SELECT status
+		FROM content_candidates
+		WHERE candidate_id = $1
+		  AND user_id = $2`, params.CandidateID, params.UserID).Scan(&sourceStatus)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return service.ErrCandidateNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("查询候选状态失败: %w", err)
+	}
+	if sourceStatus != service.CandidateStatusPending {
+		return service.ErrCandidateResolved
+	}
+	if params.MergedIntoCandidateID != "" {
+		// 来源仍待确认时，原子更新失败只能说明合并目标已离开待确认状态
+		// 或不再满足同用户、同类型条件；统一按并发冲突处理并让客户端刷新。
+		return service.ErrCandidateResolved
+	}
+	return service.ErrCandidateNotFound
 }
 
 // ConfirmKnowledgePointCandidate 在一个事务里完成：创建或关联知识点 → 关联来源片段 → 推进候选状态。

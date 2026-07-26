@@ -31,6 +31,9 @@ func TestPostgresMessageRepositoryAppendsUserMessagesIdempotently(t *testing.T) 
 		t.Fatalf("connect postgres: %v", err)
 	}
 	defer pool.Close()
+	if err := store.RunMigrations(cfg.Postgres, os.DirFS("../../migrations"), "."); err != nil {
+		t.Fatalf("run migrations: %v", err)
+	}
 
 	const (
 		userID    = "usr_message_repository_test"
@@ -252,6 +255,100 @@ func TestPostgresMessageRepositoryLoadsRecentCompletedHistory(t *testing.T) {
 	}
 	if len(deletedSessionMessages) != 0 {
 		t.Fatalf("ListMessages() deleted session = %+v, want empty", deletedSessionMessages)
+	}
+}
+
+func TestPostgresMessageRepositoryRestoresPersistedRetrievalSources(t *testing.T) {
+	if os.Getenv("INTERVIEW_AGENT_INTEGRATION_TEST") != "1" {
+		t.Skip("set INTERVIEW_AGENT_INTEGRATION_TEST=1 to run PostgreSQL integration tests")
+	}
+
+	cfg, err := config.Load("../../config.yaml")
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	pool, err := store.NewPostgres(cfg.Postgres)
+	if err != nil {
+		t.Fatalf("connect postgres: %v", err)
+	}
+	defer pool.Close()
+	if err := store.RunMigrations(cfg.Postgres, os.DirFS("../../migrations"), "."); err != nil {
+		t.Fatalf("run migrations: %v", err)
+	}
+
+	ctx := context.Background()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin transaction: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	const (
+		userID    = "usr_message_retrieval_test"
+		sessionID = "session_00000000000000000000000000000079"
+		docID     = "00000000-0000-4000-8000-000000000979"
+		versionID = "00000000-0000-4000-8000-000000000978"
+		usageID   = "00000000-0000-4000-8000-000000000977"
+		chunkID   = "00000000-0000-4000-8000-000000000976"
+		requestID = "00000000-0000-4000-8000-000000000975"
+		messageID = "00000000-0000-4000-8000-000000000974"
+	)
+	if _, err := tx.Exec(ctx, `INSERT INTO agent_user (user_id, user_type, status) VALUES ($1, 0, 0)`, userID); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO agent_memory_session (session_id, user_id) VALUES ($1, $2)`, sessionID, userID); err != nil {
+		t.Fatalf("insert session: %v", err)
+	}
+	seedRetrievalDocument(t, ctx, tx, retrievalDocumentSpec{
+		userID: userID, docID: docID, versionID: versionID, usageID: usageID,
+		title: "Outbox 笔记", aiRetrieval: true,
+		chunks: []retrievalChunkSpec{{chunkID: chunkID, ordinal: 1, headingPath: []string{"补偿任务"}, content: "定时扫描未发送记录", retrieval: true}},
+	})
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO retrieval_requests (
+			retrieval_request_id, user_id, session_id, purpose, query_text, query_terms,
+			max_results, context_budget_chars, candidate_count, selected_count,
+			excluded_count, prompt_chars, duration_ms, status
+		) VALUES ($1, $2, $3, 'ai_retrieval', 'outbox', ARRAY['outbox'], 6, 4000, 1, 1, 0, 200, 5, 'ok')`,
+		requestID, userID, sessionID); err != nil {
+		t.Fatalf("insert retrieval request: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO retrieval_hits (
+			retrieval_request_id, source_chunk_id, user_id, document_id, document_version_id,
+			ref, rank, score, included_in_prompt, char_cost, truncated
+		) VALUES ($1, $2, $3, $4, $5, 'S1', 1, 4, TRUE, 20, TRUE)`,
+		requestID, chunkID, userID, docID, versionID); err != nil {
+		t.Fatalf("insert retrieval hit: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO agent_memory_episodic (
+			message_id, session_id, user_id, agent_id, seq, role, status, content, meta_data
+		) VALUES ($1, $2, $3, 'interview-agent', 1, 'assistant', 'completed', '基于资料回答',
+			jsonb_build_object('retrieval_request_id', $4::text))`,
+		messageID, sessionID, userID, requestID); err != nil {
+		t.Fatalf("insert message fixture: %v", err)
+	}
+
+	repository := store.NewPostgresMessageRepository(tx)
+	messages, err := repository.ListMessages(ctx, userID, sessionID)
+	if err != nil {
+		t.Fatalf("ListMessages() error = %v", err)
+	}
+	if len(messages) != 1 || messages[0].Retrieval == nil || len(messages[0].Retrieval.Sources) != 1 {
+		t.Fatalf("messages = %+v, want one message with one persisted source", messages)
+	}
+	source := messages[0].Retrieval.Sources[0]
+	if messages[0].Retrieval.RequestID != requestID || source.Ref != "S1" || source.DocumentTitle != "Outbox 笔记" || !source.Truncated {
+		t.Fatalf("retrieval=%+v source=%+v, want original request/S1/title/truncated", messages[0].Retrieval, source)
+	}
+
+	reply, found, err := repository.FindAssistantReplyByID(ctx, userID, sessionID, messageID)
+	if err != nil || !found || reply.Retrieval == nil || reply.Retrieval.RequestID != requestID {
+		t.Fatalf("FindAssistantReplyByID() reply=%+v found=%v err=%v", reply, found, err)
+	}
+	if _, found, err := repository.FindAssistantReplyByID(ctx, "usr_other", sessionID, messageID); err != nil || found {
+		t.Fatalf("foreign replay found=%v err=%v, want false/nil", found, err)
 	}
 }
 

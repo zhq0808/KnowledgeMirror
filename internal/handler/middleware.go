@@ -132,3 +132,14 @@ func bodyLimitMiddleware(maxBytes int64) gin.HandlerFunc {
 		c.Next()
 	}
 }
+
+func bodyLimitMiddlewareExcept(maxBytes int64, method, path string) gin.HandlerFunc {
+	limited := bodyLimitMiddleware(maxBytes)
+	return func(c *gin.Context) {
+		if c.Request.Method == method && c.Request.URL.Path == path {
+			c.Next()
+			return
+		}
+		limited(c)
+	}
+}

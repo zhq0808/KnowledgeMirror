@@ -208,19 +208,22 @@ func (s *Server) chatStreamHandler(c *gin.Context) {
 		return writeSSE("", string(payload))
 	}
 
+	var retrievalRequestID string
+
 	// persistAndFinish 是"正常回复"和"降级兜底回复"共享的收尾规则：先落库，落库成功才发 `done`；
 	// 落库失败发 `error`，绝不能让客户端已经看到的内容和数据库历史不一致。
 	// 返回值表示这一轮 turn 是否真正走到了成功终态（用于决定 leaseStatus）。
 	persistAndFinish := func(content string) bool {
 		if _, err := s.turnLeases.Complete(c.Request.Context(), service.CompleteTurnRequest{
-			UserID:          userID,
-			SessionID:       req.SessionID,
-			ClientMessageID: req.ClientMessageID,
-			AttemptNo:       leaseResult.Lease.AttemptNo,
-			UserMessageID:   leaseResult.UserMessage.MessageID,
-			Content:         content,
-			PromptVersion:   s.chat.PromptVersion(),
-			ModelName:       s.chat.ModelName(),
+			UserID:             userID,
+			SessionID:          req.SessionID,
+			ClientMessageID:    req.ClientMessageID,
+			AttemptNo:          leaseResult.Lease.AttemptNo,
+			UserMessageID:      leaseResult.UserMessage.MessageID,
+			Content:            content,
+			PromptVersion:      s.chat.PromptVersion(),
+			ModelName:          s.chat.ModelName(),
+			RetrievalRequestID: retrievalRequestID,
 		}); err != nil {
 			s.log.Error("assistant 消息落库失败",
 				"trace_id", TraceIDFromContext(c.Request.Context()),
@@ -248,7 +251,30 @@ func (s *Server) chatStreamHandler(c *gin.Context) {
 		return true
 	}
 
-	assistantContent, err := s.chat.Stream(ctx, userID, history, sendDelta)
+	// 引用来源必须在首个内容增量之前下发，前端才能先渲染引用卡片再逐字上屏。
+	sendSources := func(result service.RetrievalResult) error {
+		retrievalRequestID = result.RequestID
+		payload, err := json.Marshal(newRetrievalSourcesResponse(result))
+		if err != nil {
+			// 序列化失败不影响回复本身，只是这一轮没有引用卡片。
+			s.log.Warn("序列化检索来源失败",
+				"trace_id", TraceIDFromContext(c.Request.Context()),
+				"session_id", req.SessionID,
+				"error", err,
+			)
+			return nil
+		}
+		return writeSSE("sources", string(payload))
+	}
+
+	assistantContent, err := s.chat.Stream(ctx, service.ChatStreamRequest{
+		UserID:      userID,
+		SessionID:   req.SessionID,
+		TraceID:     TraceIDFromContext(c.Request.Context()),
+		History:     history,
+		OnRetrieval: sendSources,
+		OnDelta:     sendDelta,
+	})
 	if err != nil {
 		// 未配置 Key：不算服务故障，当作一段普通回复流出去，方便本地先跑通链路。
 		// 兜底回复也要走跟正常回复一样的落库规则，否则刷新后历史里会缺这一轮 assistant 回复。
@@ -304,6 +330,14 @@ func (s *Server) replayCompletedTurn(c *gin.Context, userID, sessionID string, r
 	if !canFlush {
 		fail(c, http.StatusInternalServerError, CodeInternal, "服务器不支持流式输出")
 		return
+	}
+	if sources := newPersistedRetrievalSourcesResponse(reply.Retrieval); sources != nil {
+		payload, marshalErr := json.Marshal(sources)
+		if marshalErr != nil {
+			s.log.Warn("序列化回放检索来源失败", "trace_id", TraceIDFromContext(c.Request.Context()), "error", marshalErr)
+		} else if err := writeSSE("sources", string(payload)); err != nil {
+			return
+		}
 	}
 	payload, _ := json.Marshal(map[string]string{"delta": reply.Content})
 	if err := writeSSE("", string(payload)); err != nil {

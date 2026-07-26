@@ -115,10 +115,28 @@ const CONFIRM_ACTION_LABELS: Record<string, string> = {
   reference_only: "仅作参考资料",
 };
 
+const EXTRACTABLE_PURPOSES_BY_KIND: Record<DocumentKind, DocumentPurpose[]> = {
+  learning_note: ["learn", "ai_retrieval"],
+  learning_todo: ["generate_plan", "ai_retrieval"],
+  technical_material: ["learn", "ai_retrieval"],
+  target_jd: ["fact_reference", "ai_retrieval"],
+  project_fact: ["fact_reference", "ai_retrieval"],
+  interview_review: ["learn", "generate_plan", "fact_reference", "ai_retrieval"],
+  other: ["learn", "generate_plan", "fact_reference", "ai_retrieval"],
+};
+
+function canExtractCandidates(document: KnowledgeDocument): boolean {
+  return (
+    document.status === "ready" &&
+    document.purposes.some((purpose) => EXTRACTABLE_PURPOSES_BY_KIND[document.document_kind].includes(purpose))
+  );
+}
+
 // PendingUpload 是上传中的乐观占位行。它不是后端数据，成功或失败后立即移除。
 interface PendingUpload {
   key: string;
   filename: string;
+  file: File;
   error?: string;
 }
 
@@ -170,7 +188,8 @@ export function KnowledgeBasePage({ onOpenProfile }: KnowledgeBasePageProps) {
 
   const [pendingUploads, setPendingUploads] = useState<PendingUpload[]>([]);
   const [busyDocumentID, setBusyDocumentID] = useState("");
-  const [busyCandidateID, setBusyCandidateID] = useState("");
+  const [busyCandidateIDs, setBusyCandidateIDs] = useState<Set<string>>(() => new Set());
+  const [busyChunkIDs, setBusyChunkIDs] = useState<Set<string>>(() => new Set());
 
   // 资料详情
   const [detailID, setDetailID] = useState<string | null>(null);
@@ -189,34 +208,44 @@ export function KnowledgeBasePage({ onOpenProfile }: KnowledgeBasePageProps) {
   const [candidateError, setCandidateError] = useState("");
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const reloadSequence = useRef(0);
 
   const detailDocument = useMemo(
     () => documents.find((item) => item.document_id === detailID) ?? null,
     [documents, detailID],
   );
+  const detailCanExtract = detailDocument !== null && canExtractCandidates(detailDocument);
 
   // reload 是唯一的数据来源：所有写操作完成后都回到这里重新拉取，
   // 保证界面永远等于后端状态，刷新页面也不会丢。
-  const reload = useCallback(async () => {
-    setLoadError("");
+  const reload = useCallback(async (showLoading = false) => {
+    const requestSequence = ++reloadSequence.current;
+    if (showLoading) {
+      setLoading(true);
+      setLoadError("");
+    }
     try {
       const [docs, pending, points] = await Promise.all([
         listDocuments(),
         listCandidates({ status: "pending" }),
         listKnowledgePoints(),
       ]);
-      setDocuments(docs);
-      setCandidates(pending);
-      setKnowledgePoints(points);
+      if (requestSequence === reloadSequence.current) {
+        setDocuments(docs);
+        setCandidates(pending);
+        setKnowledgePoints(points);
+      }
     } catch (error) {
-      setLoadError(messageOf(error, "加载知识库失败"));
+      if (requestSequence === reloadSequence.current) {
+        setLoadError(messageOf(error, "加载知识库失败"));
+      }
     } finally {
-      setLoading(false);
+      if (requestSequence === reloadSequence.current) setLoading(false);
     }
   }, []);
 
   useEffect(() => {
-    void reload();
+    void reload(true);
   }, [reload]);
 
   // 解析在上传请求内同步完成，但重试解析等操作仍可能留下 parsing 状态；
@@ -244,14 +273,14 @@ export function KnowledgeBasePage({ onOpenProfile }: KnowledgeBasePageProps) {
   // 上传
   // -------------------------------------------------------------------------
 
-  const handleUpload = async (file: File) => {
-    // 幂等键在整个上传过程中保持不变，网络重试不会产生第二个版本。
-    const key = newIdempotencyKey();
-    setPendingUploads((current) => [...current, { key, filename: file.name }]);
+  const submitUpload = async (upload: PendingUpload) => {
+    setPendingUploads((current) =>
+      current.map((item) => (item.key === upload.key ? { ...item, error: undefined } : item)),
+    );
     setNotice("");
     try {
-      const result = await uploadDocument(file, key);
-      setPendingUploads((current) => current.filter((item) => item.key !== key));
+      const result = await uploadDocument(upload.file, upload.key);
+      setPendingUploads((current) => current.filter((item) => item.key !== upload.key));
       if (result.idempotent_hit) {
         setNotice("同一次上传已完成，未重复创建版本。");
       } else if (result.duplicate_of_version_id) {
@@ -261,9 +290,16 @@ export function KnowledgeBasePage({ onOpenProfile }: KnowledgeBasePageProps) {
     } catch (error) {
       const message = messageOf(error, "上传资料失败");
       setPendingUploads((current) =>
-        current.map((item) => (item.key === key ? { ...item, error: message } : item)),
+        current.map((item) => (item.key === upload.key ? { ...item, error: message } : item)),
       );
     }
+  };
+
+  const handleUpload = (file: File) => {
+    // 一次用户上传只生成一个幂等键；网络失败后的原地重试继续复用它。
+    const upload = { key: newIdempotencyKey(), filename: file.name, file };
+    setPendingUploads((current) => [...current, upload]);
+    void submitUpload(upload);
   };
 
   const dismissUpload = (key: string) => {
@@ -272,12 +308,15 @@ export function KnowledgeBasePage({ onOpenProfile }: KnowledgeBasePageProps) {
 
   const handleRetryParse = async (documentID: string) => {
     setBusyDocumentID(documentID);
-    setNotice("");
+    if (detailID === documentID) setDraftError("");
+    else setNotice("");
     try {
       await retryParse(documentID);
       await reload();
     } catch (error) {
-      setNotice(messageOf(error, "重新解析失败"));
+      const message = messageOf(error, "重新解析失败");
+      if (detailID === documentID) setDraftError(message);
+      else setNotice(message);
     } finally {
       setBusyDocumentID("");
     }
@@ -352,12 +391,20 @@ export function KnowledgeBasePage({ onOpenProfile }: KnowledgeBasePageProps) {
         content_origin: draft.contentOrigin,
         document_kind: draft.documentKind,
       });
-      await confirmUsages(detailDocument.document_id, normalizePurposes(draft.purposes));
+      try {
+        await confirmUsages(detailDocument.document_id, normalizePurposes(draft.purposes));
+      } catch (error) {
+        await reload();
+        setDraftError(
+          `来源、类别与标题已保存；用途保存失败：${messageOf(error, "请重试用途确认")}`,
+        );
+        return;
+      }
       await reload();
       setNotice("已保存来源、类别与用途。");
       closeDetail();
     } catch (error) {
-      setDraftError(messageOf(error, "保存资料失败"));
+      setDraftError(messageOf(error, "保存来源、类别与标题失败"));
     } finally {
       setBusyDocumentID("");
     }
@@ -375,7 +422,8 @@ export function KnowledgeBasePage({ onOpenProfile }: KnowledgeBasePageProps) {
   };
 
   const handleToggleChunk = async (chunk: SourceChunk) => {
-    if (!detailDocument) return;
+    if (!detailDocument || busyChunkIDs.has(chunk.source_chunk_id)) return;
+    setBusyChunkIDs((current) => new Set(current).add(chunk.source_chunk_id));
     setDraftError("");
     try {
       const updated = await setChunkRetrieval(
@@ -390,6 +438,12 @@ export function KnowledgeBasePage({ onOpenProfile }: KnowledgeBasePageProps) {
       );
     } catch (error) {
       setDraftError(messageOf(error, "更新来源片段失败"));
+    } finally {
+      setBusyChunkIDs((current) => {
+        const next = new Set(current);
+        next.delete(chunk.source_chunk_id);
+        return next;
+      });
     }
   };
 
@@ -437,7 +491,8 @@ export function KnowledgeBasePage({ onOpenProfile }: KnowledgeBasePageProps) {
     action: () => Promise<unknown>,
     successNotice: string,
   ) => {
-    setBusyCandidateID(candidateID);
+    if (busyCandidateIDs.has(candidateID)) return;
+    setBusyCandidateIDs((current) => new Set(current).add(candidateID));
     setCandidateError("");
     try {
       await action();
@@ -453,7 +508,11 @@ export function KnowledgeBasePage({ onOpenProfile }: KnowledgeBasePageProps) {
         await reload();
       }
     } finally {
-      setBusyCandidateID("");
+      setBusyCandidateIDs((current) => {
+        const next = new Set(current);
+        next.delete(candidateID);
+        return next;
+      });
     }
   };
 
@@ -478,7 +537,7 @@ export function KnowledgeBasePage({ onOpenProfile }: KnowledgeBasePageProps) {
     );
   }, [candidates, editingCandidate]);
 
-  const pendingCount = candidates.length + pendingUploads.length;
+  const pendingCount = candidates.length;
 
   // -------------------------------------------------------------------------
   // 渲染
@@ -572,14 +631,25 @@ export function KnowledgeBasePage({ onOpenProfile }: KnowledgeBasePageProps) {
                     </p>
                   </div>
                   {upload.error && (
-                    <button
-                      type="button"
-                      onClick={() => dismissUpload(upload.key)}
-                      aria-label="忽略上传失败"
-                      className="flex size-8 flex-shrink-0 items-center justify-center rounded-full text-muted-foreground hover:bg-secondary"
-                    >
-                      <X size={14} />
-                    </button>
+                    <div className="flex flex-shrink-0 items-center gap-1">
+                      <button
+                        type="button"
+                        onClick={() => void submitUpload(upload)}
+                        title="使用同一幂等键重试"
+                        className="flex h-8 items-center gap-1 rounded-md px-2 text-[10px] font-medium text-primary hover:bg-secondary"
+                      >
+                        <RefreshCw size={12} />
+                        重试
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => dismissUpload(upload.key)}
+                        aria-label="忽略上传失败"
+                        className="flex size-8 items-center justify-center rounded-full text-muted-foreground hover:bg-secondary"
+                      >
+                        <X size={14} />
+                      </button>
+                    </div>
                   )}
                 </div>
               </article>
@@ -597,7 +667,7 @@ export function KnowledgeBasePage({ onOpenProfile }: KnowledgeBasePageProps) {
               <p className="mt-2 text-[13px] font-medium text-foreground">{loadError}</p>
               <button
                 type="button"
-                onClick={() => void reload()}
+                onClick={() => void reload(true)}
                 className="mt-3 inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-[11px] font-semibold text-white"
               >
                 <RefreshCw size={13} />
@@ -758,7 +828,7 @@ export function KnowledgeBasePage({ onOpenProfile }: KnowledgeBasePageProps) {
                           "已拒绝该候选。",
                         )
                       }
-                      disabled={busyCandidateID === candidate.candidate_id}
+                      disabled={busyCandidateIDs.has(candidate.candidate_id)}
                       aria-label={`拒绝候选：${candidate.title}`}
                       title="拒绝"
                       className="flex size-8 flex-shrink-0 items-center justify-center rounded-full text-muted-foreground hover:bg-secondary hover:text-foreground disabled:opacity-40"
@@ -804,7 +874,7 @@ export function KnowledgeBasePage({ onOpenProfile }: KnowledgeBasePageProps) {
                           "已归档该候选。",
                         )
                       }
-                      disabled={busyCandidateID === candidate.candidate_id}
+                      disabled={busyCandidateIDs.has(candidate.candidate_id)}
                       className="flex h-8 items-center gap-1.5 rounded-md px-2.5 text-[11px] font-medium text-muted-foreground hover:bg-secondary disabled:opacity-40"
                     >
                       <Archive size={13} />
@@ -819,7 +889,7 @@ export function KnowledgeBasePage({ onOpenProfile }: KnowledgeBasePageProps) {
                           "已确认该候选。掌握状态不会因此改变。",
                         )
                       }
-                      disabled={busyCandidateID === candidate.candidate_id}
+                      disabled={busyCandidateIDs.has(candidate.candidate_id)}
                       className="flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-[11px] font-semibold text-white hover:bg-primary/90 disabled:opacity-40"
                     >
                       <Check size={13} />
@@ -1028,7 +1098,10 @@ export function KnowledgeBasePage({ onOpenProfile }: KnowledgeBasePageProps) {
                           <input
                             type="checkbox"
                             checked={chunk.retrieval_enabled}
-                            disabled={!detailDocument.purposes.includes("ai_retrieval")}
+                            disabled={
+                              !detailDocument.purposes.includes("ai_retrieval") ||
+                              busyChunkIDs.has(chunk.source_chunk_id)
+                            }
                             onChange={() => void handleToggleChunk(chunk)}
                             className="size-3.5 accent-[#28573A]"
                           />
@@ -1045,7 +1118,10 @@ export function KnowledgeBasePage({ onOpenProfile }: KnowledgeBasePageProps) {
                 <button
                   type="button"
                   onClick={() => void handleExtract()}
-                  disabled={busyDocumentID === detailDocument.document_id}
+                  disabled={
+                    busyDocumentID === detailDocument.document_id || !detailCanExtract
+                  }
+                  title={detailCanExtract ? "抽取待确认候选" : "当前类别与用途不能产生候选"}
                   className="flex h-8 items-center gap-1.5 rounded-md border border-border px-2.5 text-[11px] font-medium text-foreground hover:bg-secondary disabled:opacity-40"
                 >
                   <Sparkles size={13} />
@@ -1156,7 +1232,10 @@ export function KnowledgeBasePage({ onOpenProfile }: KnowledgeBasePageProps) {
                     "已修改候选内容，它仍在待确认列表里。",
                   )
                 }
-                disabled={!candidateDraft.title.trim() || busyCandidateID !== ""}
+                disabled={
+                  !candidateDraft.title.trim() ||
+                  (editingCandidate !== null && busyCandidateIDs.has(editingCandidate.candidate_id))
+                }
                 className="h-9 w-full rounded-md border border-border text-[12px] font-medium text-foreground hover:bg-secondary disabled:opacity-40"
               >
                 只保存修改
@@ -1186,7 +1265,10 @@ export function KnowledgeBasePage({ onOpenProfile }: KnowledgeBasePageProps) {
                         "已关联到已有知识点。",
                       )
                     }
-                    disabled={!linkTargetID || busyCandidateID !== ""}
+                    disabled={
+                      !linkTargetID ||
+                      (editingCandidate !== null && busyCandidateIDs.has(editingCandidate.candidate_id))
+                    }
                     className="mt-2 h-9 w-full rounded-md border border-border text-[12px] font-medium text-foreground hover:bg-secondary disabled:opacity-40"
                   >
                     确认并关联
@@ -1218,7 +1300,10 @@ export function KnowledgeBasePage({ onOpenProfile }: KnowledgeBasePageProps) {
                         "已合并到目标候选。",
                       )
                     }
-                    disabled={!mergeTargetID || busyCandidateID !== ""}
+                    disabled={
+                      !mergeTargetID ||
+                      (editingCandidate !== null && busyCandidateIDs.has(editingCandidate.candidate_id))
+                    }
                     className="mt-2 h-9 w-full rounded-md border border-border text-[12px] font-medium text-foreground hover:bg-secondary disabled:opacity-40"
                   >
                     确认合并
@@ -1253,7 +1338,10 @@ export function KnowledgeBasePage({ onOpenProfile }: KnowledgeBasePageProps) {
                   "已确认该候选。掌握状态不会因此改变。",
                 );
               }}
-              disabled={!candidateDraft.title.trim() || busyCandidateID !== ""}
+              disabled={
+                !candidateDraft.title.trim() ||
+                (editingCandidate !== null && busyCandidateIDs.has(editingCandidate.candidate_id))
+              }
               className="rounded-lg bg-primary px-4 py-2 text-[13px] font-semibold text-white hover:bg-primary/90 disabled:opacity-40"
             >
               修改后确认

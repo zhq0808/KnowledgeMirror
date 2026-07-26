@@ -168,7 +168,17 @@ func TestListSessionMessagesHandlerReturnsOwnedSessionMessages(t *testing.T) {
 	messageRepository := &handlerMessageRepository{
 		sessionMessages: []service.SessionMessage{
 			{MessageID: "m1", Role: "user", Content: "早上体检报告有点异常", Seq: 1},
-			{MessageID: "m2", Role: "assistant", Content: "具体是哪项指标异常呢？", Seq: 2},
+			{
+				MessageID: "m2", Role: "assistant", Content: "具体是哪项指标异常呢？", Seq: 2,
+				Retrieval: &service.MessageRetrieval{
+					RequestID: "00000000-0000-4000-8000-000000000099",
+					Status:    service.RetrievalStatusOK, CandidateCount: 1,
+					Sources: []service.SessionRetrievalSource{{
+						Ref: "S1", SourceChunkID: "chunk-1", DocumentID: "doc-1",
+						DocumentTitle: "体检资料", VersionNo: 2, OriginLabel: "用户笔记", TrustLabel: "用户已确认",
+					}},
+				},
+			},
 		},
 	}
 	server := &Server{
@@ -187,6 +197,11 @@ func TestListSessionMessagesHandlerReturnsOwnedSessionMessages(t *testing.T) {
 	assistantIndex := strings.Index(body, "具体是哪项指标异常呢？")
 	if userIndex < 0 || assistantIndex < 0 || userIndex >= assistantIndex {
 		t.Fatalf("body = %q, want both messages in seq order", body)
+	}
+	if !strings.Contains(body, `"request_id":"00000000-0000-4000-8000-000000000099"`) ||
+		!strings.Contains(body, `"document_title":"体检资料"`) ||
+		!strings.Contains(body, `"ref":"S1"`) {
+		t.Fatalf("body = %q, want persisted retrieval sources", body)
 	}
 }
 

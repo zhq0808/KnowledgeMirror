@@ -15,6 +15,10 @@ type ChatPromptData struct {
 	Version         string
 	TrustBoundary   string
 	UserFactSummary string
+	// RetrievedContext 是已授权资料的受控数据块。
+	// 它永远由服务端渲染（命中/未命中/未启用/检索故障都有固定文案），
+	// 不允许为空串——空串会让模型自行脑补“我应该有资料”。
+	RetrievedContext string
 }
 
 // ChatPrompt 是启动时完成解析、请求时只负责渲染的版本化 Prompt。
@@ -47,7 +51,7 @@ func LoadChatPrompt(path, version, trustBoundary string) (*ChatPrompt, error) {
 }
 
 func validateRequiredPromptVariables(templateText string) error {
-	for _, variable := range []string{".Version", ".TrustBoundary", ".UserFactSummary"} {
+	for _, variable := range []string{".Version", ".TrustBoundary", ".UserFactSummary", ".RetrievedContext"} {
 		if !strings.Contains(templateText, "{{"+variable+"}}") {
 			return fmt.Errorf("chat prompt 模板缺少必需变量 {{%s}}", variable)
 		}
@@ -72,7 +76,7 @@ func ParseChatPrompt(templateText, version, trustBoundary string) (*ChatPrompt, 
 		trustBoundary: strings.TrimSpace(trustBoundary),
 		template:      parsed,
 	}
-	if _, err := prompt.Render(""); err != nil {
+	if _, err := prompt.Render("", ""); err != nil {
 		return nil, fmt.Errorf("校验 chat prompt 模板失败: %w", err)
 	}
 	return prompt, nil
@@ -82,8 +86,8 @@ func (p *ChatPrompt) Version() string {
 	return p.version
 }
 
-// Render 只接收服务端确认过的用户事实摘要；空值使用明确占位，避免模型自行猜测。
-func (p *ChatPrompt) Render(userFactSummary string) (string, error) {
+// Render 只接收服务端确认过的用户事实摘要与已授权资料数据块；空值使用明确占位，避免模型自行猜测。
+func (p *ChatPrompt) Render(userFactSummary, retrievedContext string) (string, error) {
 	if p == nil || p.template == nil {
 		return "", fmt.Errorf("chat prompt 未初始化")
 	}
@@ -91,11 +95,16 @@ func (p *ChatPrompt) Render(userFactSummary string) (string, error) {
 	if userFactSummary == "" {
 		userFactSummary = noConfirmedUserFacts
 	}
+	retrievedContext = strings.TrimSpace(retrievedContext)
+	if retrievedContext == "" {
+		retrievedContext = retrievalDisabledNotice
+	}
 	var rendered bytes.Buffer
 	if err := p.template.Execute(&rendered, ChatPromptData{
-		Version:         p.version,
-		TrustBoundary:   p.trustBoundary,
-		UserFactSummary: userFactSummary,
+		Version:          p.version,
+		TrustBoundary:    p.trustBoundary,
+		UserFactSummary:  userFactSummary,
+		RetrievedContext: retrievedContext,
 	}); err != nil {
 		return "", fmt.Errorf("渲染 chat prompt 模板失败: %w", err)
 	}

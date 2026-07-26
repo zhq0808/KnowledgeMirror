@@ -68,14 +68,15 @@ type AcquireTurnLeaseResult struct {
 // CompleteTurnRequest 把当前 attempt 的 assistant 结果落库并将 turn 原子推进到 completed。
 // UserMessageID 是本轮 user 消息的 UUID message_id。
 type CompleteTurnRequest struct {
-	UserID          string
-	SessionID       string
-	ClientMessageID string
-	AttemptNo       int64
-	UserMessageID   string
-	Content         string
-	PromptVersion   string
-	ModelName       string
+	UserID             string
+	SessionID          string
+	ClientMessageID    string
+	AttemptNo          int64
+	UserMessageID      string
+	Content            string
+	PromptVersion      string
+	ModelName          string
+	RetrievalRequestID string
 }
 
 // ReleaseTurnLeaseRequest 是释放（结束）一个 turn 租约所需的信息。

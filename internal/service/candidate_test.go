@@ -55,8 +55,9 @@ type fakeCandidateRepository struct {
 	nextID          int
 
 	// saveErr / resolveErr 用来模拟数据库故障，验证故障时不会留下半成品数据。
-	saveErr    error
-	resolveErr error
+	saveErr       error
+	resolveErr    error
+	beforeResolve func(*fakeCandidateRepository, ResolveCandidateParams)
 }
 
 func newFakeCandidateRepository() *fakeCandidateRepository {
@@ -135,12 +136,21 @@ func (f *fakeCandidateRepository) ResolveCandidate(_ context.Context, params Res
 	if f.resolveErr != nil {
 		return ContentCandidate{}, f.resolveErr
 	}
+	if f.beforeResolve != nil {
+		f.beforeResolve(f, params)
+	}
 	candidate, found := f.candidates[params.CandidateID]
 	if !found || candidate.UserID != params.UserID {
 		return ContentCandidate{}, ErrCandidateNotFound
 	}
 	if candidate.Status != CandidateStatusPending {
 		return ContentCandidate{}, ErrCandidateResolved
+	}
+	if params.MergedIntoCandidateID != "" {
+		target, found := f.candidates[params.MergedIntoCandidateID]
+		if !found || target.UserID != params.UserID || target.Status != CandidateStatusPending || target.CandidateType != candidate.CandidateType {
+			return ContentCandidate{}, ErrCandidateResolved
+		}
 	}
 	candidate.Status = params.Status
 	candidate.ConfirmedOutcome = params.Outcome
@@ -610,6 +620,32 @@ func TestMergeArchiveReject(t *testing.T) {
 	}
 	if rejectedResult.TrustLevel != CandidateTrustUnverified {
 		t.Fatalf("拒绝不得改变可信级别")
+	}
+}
+
+func TestMergeRejectsTargetResolvedAfterValidation(t *testing.T) {
+	repository := newFakeCandidateRepository()
+	service := NewCandidateService(repository, &fakeCandidateDocuments{}, nil, DefaultCandidateLimits())
+	source := repository.put(ContentCandidate{
+		CandidateID: "source", UserID: "user-1", CandidateType: CandidateTypeKnowledgePoint,
+		Status: CandidateStatusPending, TrustLevel: CandidateTrustUnverified,
+	})
+	target := repository.put(ContentCandidate{
+		CandidateID: "target", UserID: "user-1", CandidateType: CandidateTypeKnowledgePoint,
+		Status: CandidateStatusPending, TrustLevel: CandidateTrustUnverified,
+	})
+	repository.beforeResolve = func(repository *fakeCandidateRepository, _ ResolveCandidateParams) {
+		resolvedTarget := repository.candidates[target.CandidateID]
+		resolvedTarget.Status = CandidateStatusConfirmed
+		repository.candidates[target.CandidateID] = resolvedTarget
+	}
+
+	_, err := service.Merge(context.Background(), "user-1", source.CandidateID, target.CandidateID, "")
+	if !errors.Is(err, ErrCandidateResolved) {
+		t.Fatalf("err = %v, want ErrCandidateResolved", err)
+	}
+	if got := repository.candidates[source.CandidateID].Status; got != CandidateStatusPending {
+		t.Fatalf("source status = %q, want pending", got)
 	}
 }
 

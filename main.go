@@ -157,6 +157,32 @@ func run() error {
 		MaxChars: cfg.Memory.MaxMemoryInputChars,
 	}, cfg.Chat.MaxReplyChars)
 
+	// 知识库检索 v0：只召回用户已确认“供 AI 检索”且片段开关打开的当前版本片段。
+	// 未启用时聊天链路照常工作，只是不带资料引用。
+	var retrievalService *service.RetrievalService
+	if cfg.Retrieval.Enabled {
+		retrievalService = service.NewRetrievalService(
+			store.NewPostgresRetrievalRepository(db),
+			service.RetrievalLimits{
+				MaxQueryChars:          cfg.Retrieval.MaxQueryChars,
+				MaxTerms:               cfg.Retrieval.MaxTerms,
+				MaxCandidates:          cfg.Retrieval.MaxCandidates,
+				MaxResults:             cfg.Retrieval.MaxResults,
+				MaxPassagesPerDocument: cfg.Retrieval.MaxPassagesPerDocument,
+				MaxChunkChars:          cfg.Retrieval.MaxChunkChars,
+				ContextBudgetChars:     cfg.Retrieval.ContextBudgetChars,
+			},
+			log,
+		)
+		chatService.WithRetrieval(retrievalService)
+		log.Info("知识库检索已启用",
+			"max_results", cfg.Retrieval.MaxResults,
+			"context_budget_chars", cfg.Retrieval.ContextBudgetChars,
+		)
+	} else {
+		log.Info("知识库检索未启用（RETRIEVAL_ENABLED=false）")
+	}
+
 	// 记忆抽取使用独立模型实例和 Prompt，后续调优只替换模板与版本，不改异步管道。
 	var memoryPipeline *service.MemoryPipeline
 	if cfg.Memory.Enabled {
@@ -196,7 +222,7 @@ func run() error {
 		log.Info("记忆抽取管道未启用（MEMORY_ENABLED=false）")
 	}
 
-	srvHandler := handler.NewServer(chatService, identityService, sessionService, messageService, turnLeaseService, documentService, candidateService, memoryPipeline, cfg.Identity, log).Handler()
+	srvHandler := handler.NewServer(chatService, identityService, sessionService, messageService, turnLeaseService, documentService, candidateService, retrievalService, memoryPipeline, cfg.Identity, log).Handler()
 	srv := &http.Server{
 		Addr:              ":" + cfg.HTTP.Port,
 		Handler:           srvHandler,

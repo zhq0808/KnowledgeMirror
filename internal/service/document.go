@@ -215,15 +215,12 @@ type UpdateDocumentMetadataParams struct {
 	Title         *string
 	ContentOrigin *string
 	DocumentKind  *string
-	Status        string
 }
 
 type ReplaceDocumentUsagesParams struct {
 	UserID      string
 	DocumentID  string
-	VersionID   string
 	Purposes    []string
-	Status      string
 	ConfirmedAt time.Time
 }
 
@@ -516,17 +513,10 @@ type UpdateMetadataRequest struct {
 // UpdateMetadata 应用用户确认后的来源与类别。
 // AI 只能在别处提出建议，任何建议都必须经过这个入口才会生效。
 func (s *DocumentService) UpdateMetadata(ctx context.Context, request UpdateMetadataRequest) (DocumentDetail, error) {
-	detail, err := s.repository.GetDocumentDetail(ctx, request.UserID, request.DocumentID)
-	if err != nil {
-		return DocumentDetail{}, err
-	}
-
-	origin := detail.Document.ContentOrigin
 	if request.ContentOrigin != nil {
 		if !slices.Contains(validContentOrigins, *request.ContentOrigin) {
 			return DocumentDetail{}, invalidDocumentInput("不支持的内容来源: %s", *request.ContentOrigin)
 		}
-		origin = *request.ContentOrigin
 	}
 	if request.DocumentKind != nil && !slices.Contains(validDocumentKinds, *request.DocumentKind) {
 		return DocumentDetail{}, invalidDocumentInput("不支持的内容类别: %s", *request.DocumentKind)
@@ -543,13 +533,12 @@ func (s *DocumentService) UpdateMetadata(ctx context.Context, request UpdateMeta
 		title = &normalized
 	}
 
-	err = s.repository.UpdateDocumentMetadata(ctx, UpdateDocumentMetadataParams{
+	err := s.repository.UpdateDocumentMetadata(ctx, UpdateDocumentMetadataParams{
 		UserID:        request.UserID,
 		DocumentID:    request.DocumentID,
 		Title:         title,
 		ContentOrigin: request.ContentOrigin,
 		DocumentKind:  request.DocumentKind,
-		Status:        documentStatus(origin, detail.Usages, detail.ChunkCount),
 	})
 	if err != nil {
 		return DocumentDetail{}, err
@@ -564,25 +553,11 @@ func (s *DocumentService) ConfirmUsages(ctx context.Context, userID, documentID 
 	if err != nil {
 		return DocumentDetail{}, err
 	}
-	detail, err := s.repository.GetDocumentDetail(ctx, userID, documentID)
-	if err != nil {
-		return DocumentDetail{}, err
-	}
-	if detail.ChunkCount == 0 {
-		return DocumentDetail{}, invalidDocumentInput("资料尚未解析成功，无法确认用途")
-	}
-
-	usages := make([]DocumentUsage, 0, len(normalized))
-	for _, purpose := range normalized {
-		usages = append(usages, DocumentUsage{Purpose: purpose, Enabled: true})
-	}
 
 	err = s.repository.ReplaceDocumentUsages(ctx, ReplaceDocumentUsagesParams{
 		UserID:      userID,
 		DocumentID:  documentID,
-		VersionID:   detail.Document.CurrentVersionID,
 		Purposes:    normalized,
-		Status:      documentStatus(detail.Document.ContentOrigin, usages, detail.ChunkCount),
 		ConfirmedAt: s.now(),
 	})
 	if err != nil {

@@ -85,11 +85,12 @@ func (s *Server) listSessionsHandler(c *gin.Context) {
 // sessionMessageReply 是会话消息列表接口的单项 DTO。对外只暴露稳定的 UUID message_id，
 // 不暴露数据库内部行主键 id，也不暴露 turn lease 状态记录。
 type sessionMessageReply struct {
-	MessageID string `json:"message_id"`
-	Role      string `json:"role"`
-	Content   string `json:"content"`
-	Seq       int64  `json:"seq"`
-	CreatedAt string `json:"created_at"`
+	MessageID string                    `json:"message_id"`
+	Role      string                    `json:"role"`
+	Content   string                    `json:"content"`
+	Seq       int64                     `json:"seq"`
+	Retrieval *retrievalSourcesResponse `json:"retrieval,omitempty"`
+	CreatedAt string                    `json:"created_at"`
 }
 
 // listSessionMessagesHandler 按归属返回指定会话内已完成、未删除的 user/assistant 消息。
@@ -130,6 +131,7 @@ func (s *Server) listSessionMessagesHandler(c *gin.Context) {
 			Role:      message.Role,
 			Content:   message.Content,
 			Seq:       message.Seq,
+			Retrieval: newPersistedRetrievalSourcesResponse(message.Retrieval),
 			CreatedAt: message.CreatedAt.Format(time.RFC3339),
 		})
 	}

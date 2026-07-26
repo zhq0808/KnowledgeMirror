@@ -25,6 +25,7 @@ type Server struct {
 	turnLeases     *service.TurnLeaseService
 	documents      *service.DocumentService
 	candidates     *service.CandidateService
+	retrieval      *service.RetrievalService
 	memory         memoryNotifier
 	identityConfig config.IdentityConfig
 	log            *slog.Logger
@@ -32,7 +33,7 @@ type Server struct {
 }
 
 // NewServer 构建 HTTP Server 并注册路由与中间件。memory 可为 nil（关闭异步抽取时不投递）。
-func NewServer(chat *service.ChatService, identity *service.IdentityService, sessions *service.SessionService, messages *service.MessageService, turnLeases *service.TurnLeaseService, documents *service.DocumentService, candidates *service.CandidateService, memory memoryNotifier, identityConfig config.IdentityConfig, log *slog.Logger) *Server {
+func NewServer(chat *service.ChatService, identity *service.IdentityService, sessions *service.SessionService, messages *service.MessageService, turnLeases *service.TurnLeaseService, documents *service.DocumentService, candidates *service.CandidateService, retrieval *service.RetrievalService, memory memoryNotifier, identityConfig config.IdentityConfig, log *slog.Logger) *Server {
 	gin.SetMode(gin.ReleaseMode)
 	s := &Server{
 		chat:           chat,
@@ -42,6 +43,7 @@ func NewServer(chat *service.ChatService, identity *service.IdentityService, ses
 		turnLeases:     turnLeases,
 		documents:      documents,
 		candidates:     candidates,
+		retrieval:      retrieval,
 		memory:         memory,
 		identityConfig: identityConfig,
 		log:            log,
@@ -55,16 +57,26 @@ func NewServer(chat *service.ChatService, identity *service.IdentityService, ses
 // 文本录入足够；资料上传另有 multipart 与单文件上限，见 documentBodyLimitBytes。
 const maxBodyBytes = 2 << 20
 
-// documentBodyLimitBytes 是 Markdown 上传接口的请求体上限（4MB）。
-// 需要大于单文件上限：multipart 还带边界、字段名和其它表单项。
-const documentBodyLimitBytes = 4 << 20
+// Markdown 上传至少允许 4 MiB 请求体；文件上限更大时额外预留 1 MiB multipart 开销。
+const (
+	minDocumentBodyLimitBytes = 4 << 20
+	multipartOverheadBytes    = 1 << 20
+)
+
+func documentBodyLimitBytes(maxFileBytes int64) int64 {
+	limit := maxFileBytes + multipartOverheadBytes
+	if limit < minDocumentBodyLimitBytes {
+		return minDocumentBodyLimitBytes
+	}
+	return limit
+}
 
 // routes 注册中间件与路由。
 func (s *Server) routes() {
 	s.engine.Use(traceMiddleware())
 	s.engine.Use(recoverMiddleware(s.log))
 	s.engine.Use(accessLogMiddleware(s.log))
-	s.engine.Use(bodyLimitMiddleware(maxBodyBytes))
+	s.engine.Use(bodyLimitMiddlewareExcept(maxBodyBytes, http.MethodPost, "/api/v1/documents"))
 
 	s.engine.NoRoute(func(c *gin.Context) {
 		fail(c, http.StatusNotFound, CodeNotFound, "接口不存在")
@@ -91,7 +103,7 @@ func (s *Server) routes() {
 		// 这些接口只改变资料状态，不产生知识点，也不改变任何掌握状态。
 		if s.documents != nil {
 			documents := protected.Group("/documents")
-			documents.POST("", bodyLimitMiddleware(documentBodyLimitBytes), s.uploadDocumentHandler)
+			documents.POST("", bodyLimitMiddleware(documentBodyLimitBytes(s.documents.Limits().MaxFileBytes)), s.uploadDocumentHandler)
 			documents.GET("", s.listDocumentsHandler)
 			documents.GET("/:document_id", s.getDocumentHandler)
 			documents.PATCH("/:document_id", s.updateDocumentHandler)
@@ -120,6 +132,12 @@ func (s *Server) routes() {
 			candidates.POST("/:candidate_id/reject", s.rejectCandidateHandler)
 
 			protected.GET("/knowledge-points", s.listKnowledgePointsHandler)
+		}
+
+		// 知识库检索预览：只返回当前用户已授权“供 AI 检索”的片段命中情况，
+		// 不改变任何资料状态，也不产生任何掌握状态。
+		if s.retrieval != nil {
+			protected.POST("/retrieval/preview", s.retrievalPreviewHandler)
 		}
 	}
 }

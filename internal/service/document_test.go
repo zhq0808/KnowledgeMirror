@@ -248,7 +248,13 @@ func (r *fakeDocumentRepository) UpdateDocumentMetadata(_ context.Context, param
 	if params.DocumentKind != nil {
 		entry.document.DocumentKind = *params.DocumentKind
 	}
-	entry.document.Status = params.Status
+	if entry.document.Status != DocumentStatusFailed {
+		entry.document.Status = documentStatus(
+			entry.document.ContentOrigin,
+			entry.usages,
+			len(entry.chunks[entry.document.CurrentVersionID]),
+		)
+	}
 	return nil
 }
 
@@ -257,22 +263,29 @@ func (r *fakeDocumentRepository) ReplaceDocumentUsages(_ context.Context, params
 	if err != nil {
 		return err
 	}
+	if len(entry.chunks[entry.document.CurrentVersionID]) == 0 {
+		return &DocumentInputError{Message: "资料尚未解析成功，无法确认用途"}
+	}
 	usages := make([]DocumentUsage, 0, len(params.Purposes))
 	confirmedAt := params.ConfirmedAt
 	for _, purpose := range params.Purposes {
 		usages = append(usages, DocumentUsage{Purpose: purpose, Enabled: true, ConfirmedAt: &confirmedAt})
 	}
 	entry.usages = usages
-	entry.document.Status = params.Status
+	entry.document.Status = documentStatus(
+		entry.document.ContentOrigin,
+		entry.usages,
+		len(entry.chunks[entry.document.CurrentVersionID]),
+	)
 
 	// 片段级检索开关跟随资料级 ai_retrieval 用途：关闭授权后不留可召回残片。
 	retrievalEnabled := slices.Contains(params.Purposes, DocumentPurposeAIRetrieval)
-	for versionID, chunks := range entry.chunks {
-		for index := range chunks {
-			chunks[index].RetrievalEnabled = retrievalEnabled
-		}
-		entry.chunks[versionID] = chunks
+	versionID := entry.document.CurrentVersionID
+	chunks := entry.chunks[versionID]
+	for index := range chunks {
+		chunks[index].RetrievalEnabled = retrievalEnabled
 	}
+	entry.chunks[versionID] = chunks
 	return nil
 }
 

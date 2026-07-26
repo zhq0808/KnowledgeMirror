@@ -216,6 +216,11 @@ func (s *Server) uploadDocumentHandler(c *gin.Context) {
 
 	fileHeader, err := c.FormFile(uploadFormField)
 	if err != nil {
+		var maxBytesError *http.MaxBytesError
+		if errors.As(err, &maxBytesError) {
+			fail(c, http.StatusRequestEntityTooLarge, CodeBadRequest, "请求体大小超过上限")
+			return
+		}
 		fail(c, http.StatusBadRequest, CodeBadRequest, "请通过 file 字段上传 Markdown 文件")
 		return
 	}
