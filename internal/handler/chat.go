@@ -21,6 +21,10 @@ type chatRequest struct {
 	SessionID       string `json:"session_id"`
 	ClientMessageID string `json:"client_message_id"`
 	Message         string `json:"message"`
+	// VoiceCaptureID 可选：这条消息是哪段录音转写来的。
+	// 它只用于把原始转写和用户实际发出的文本关联起来，
+	// 不影响任何对话逻辑：语音和打字到了这里已经是同一件东西。
+	VoiceCaptureID string `json:"voice_capture_id"`
 }
 
 var clientMessageIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
@@ -85,6 +89,11 @@ func (s *Server) chatStreamHandler(c *gin.Context) {
 	}
 	if strings.TrimSpace(req.Message) == "" {
 		fail(c, http.StatusBadRequest, CodeBadRequest, "消息不能为空")
+		return
+	}
+	req.VoiceCaptureID = strings.TrimSpace(req.VoiceCaptureID)
+	if req.VoiceCaptureID != "" && !uuidPattern.MatchString(req.VoiceCaptureID) {
+		fail(c, http.StatusBadRequest, CodeBadRequest, "语音记录ID格式错误")
 		return
 	}
 	userID, ok := UserIDFromContext(c.Request.Context())
@@ -155,6 +164,23 @@ func (s *Server) chatStreamHandler(c *gin.Context) {
 		}
 		s.replayCompletedTurn(c, userID, req.SessionID, leaseResult.Lease.ResultMessageID)
 		return
+	}
+
+	// 语音来源绑定：拿到真实落库的 message_id 后，把“原始转写”和“用户真正发出的文本”
+	// 钩到一起，两份都在，谁也没覆盖谁。
+	// 失败只记 ERROR 不中断本轮对话：这只是一条溯源元数据，
+	// 为了它把用户已经说出口的话扔掉是本末倒置。
+	if req.VoiceCaptureID != "" && s.voice != nil {
+		if bindErr := s.voice.BindMessage(c.Request.Context(), userID, req.SessionID,
+			req.VoiceCaptureID, leaseResult.UserMessage.MessageID); bindErr != nil {
+			s.log.Error("绑定语音转写失败",
+				"trace_id", TraceIDFromContext(c.Request.Context()),
+				"session_id", req.SessionID,
+				"capture_id", req.VoiceCaptureID,
+				"message_id", leaseResult.UserMessage.MessageID,
+				"error", bindErr,
+			)
+		}
 	}
 
 	turnCompleted := false
@@ -240,7 +266,7 @@ func (s *Server) chatStreamHandler(c *gin.Context) {
 		if s.memory != nil {
 			s.memory.Notify(req.SessionID)
 		}
-		if err := writeSSE("done", "{}"); err != nil {
+		if err := writeSSE("done", s.doneFramePayload(c, userID, req.SessionID)); err != nil {
 			s.log.Warn("turn 已完成但 done 事件发送失败",
 				"trace_id", TraceIDFromContext(c.Request.Context()),
 				"session_id", req.SessionID,
@@ -268,12 +294,14 @@ func (s *Server) chatStreamHandler(c *gin.Context) {
 	}
 
 	assistantContent, err := s.chat.Stream(ctx, service.ChatStreamRequest{
-		UserID:      userID,
-		SessionID:   req.SessionID,
-		TraceID:     TraceIDFromContext(c.Request.Context()),
-		History:     history,
-		OnRetrieval: sendSources,
-		OnDelta:     sendDelta,
+		UserID:        userID,
+		SessionID:     req.SessionID,
+		TraceID:       TraceIDFromContext(c.Request.Context()),
+		History:       history,
+		Message:       strings.TrimSpace(req.Message),
+		UserMessageID: leaseResult.UserMessage.MessageID,
+		OnRetrieval:   sendSources,
+		OnDelta:       sendDelta,
 	})
 	if err != nil {
 		// 未配置 Key：不算服务故障，当作一段普通回复流出去，方便本地先跑通链路。
@@ -343,5 +371,30 @@ func (s *Server) replayCompletedTurn(c *gin.Context, userID, sessionID string, r
 	if err := writeSSE("", string(payload)); err != nil {
 		return // 客户端已断开，没必要再发 done。
 	}
-	_ = writeSSE("done", "{}")
+	_ = writeSSE("done", s.doneFramePayload(c, userID, sessionID))
+}
+
+// doneFramePayload 组装 done 帧内容。
+//
+// 费曼练习状态挂在 done 帧上，而不是单独开一次轮询：这一轮消息很可能刚刚改变了练习状态
+// （比如从“等回答”推进到下一个追问），前端必须在同一次交互里拿到最新状态条。
+// 任何读取失败都退回空对象——状态条缺一次不影响对话本身。
+func (s *Server) doneFramePayload(c *gin.Context, userID, sessionID string) string {
+	if s.practice == nil {
+		return "{}"
+	}
+	state, err := s.practice.State(c.Request.Context(), userID, sessionID)
+	if err != nil {
+		s.log.Warn("读取费曼练习状态失败，本轮不下发状态条",
+			"trace_id", TraceIDFromContext(c.Request.Context()),
+			"session_id", sessionID,
+			"error", err,
+		)
+		return "{}"
+	}
+	payload, err := json.Marshal(map[string]any{"feynman": newFeynmanPracticeStateResponse(state)})
+	if err != nil {
+		return "{}"
+	}
+	return string(payload)
 }

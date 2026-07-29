@@ -19,6 +19,8 @@ import (
 	"healthAgent/internal/logger"
 	"healthAgent/internal/service"
 	"healthAgent/internal/store"
+	"healthAgent/internal/stt"
+	"healthAgent/internal/tts"
 )
 
 // migrationsFS 把 migrations/ 下的 SQL 打进二进制，部署时无需额外携带脚本。
@@ -222,7 +224,185 @@ func run() error {
 		log.Info("记忆抽取管道未启用（MEMORY_ENABLED=false）")
 	}
 
-	srvHandler := handler.NewServer(chatService, identityService, sessionService, messageService, turnLeaseService, documentService, candidateService, retrievalService, memoryPipeline, cfg.Identity, log).Handler()
+	// 语音费曼练习 v0：录音上传 -> STT 转写 -> 用户确认；未配置 STT API Key 时自动降级为
+	// 本地占位供应商，保证本地开发和没有第三方密钥的环境也能跑通整条链路。
+	var sttProvider stt.Provider
+	switch {
+	case cfg.Feynman.STT.APIKey == "":
+		sttProvider = stt.NewLocalPlaceholderProvider()
+	case cfg.Feynman.STT.Provider == stt.OpenAIWhisperProviderName:
+		sttProvider = stt.NewOpenAIWhisperProvider(
+			cfg.Feynman.STT.APIKey,
+			cfg.Feynman.STT.BaseURL,
+			cfg.Feynman.STT.Model,
+			time.Duration(cfg.Feynman.STT.TimeoutSeconds)*time.Second,
+		)
+	default:
+		// 缺省走 MiMo；配错供应商名时也落到这里，但会先警告。
+		if cfg.Feynman.STT.Provider != stt.MiMoASRProviderName {
+			log.Warn("未知的 STT 供应商名，已回退到 MiMo ASR",
+				"configured", cfg.Feynman.STT.Provider)
+		}
+		sttProvider = stt.NewMiMoASRProvider(
+			cfg.Feynman.STT.APIKey,
+			cfg.Feynman.STT.BaseURL,
+			cfg.Feynman.STT.Model,
+			cfg.Feynman.STT.Language,
+			time.Duration(cfg.Feynman.STT.TimeoutSeconds)*time.Second,
+		)
+	}
+	feynmanService := service.NewFeynmanService(
+		store.NewPostgresFeynmanRepository(db),
+		sttProvider,
+		service.FeynmanLimits{
+			MaxAudioBytes:      cfg.Feynman.MaxAudioBytes,
+			MaxDurationMS:      cfg.Feynman.MaxDurationMS,
+			MaxTranscriptChars: cfg.Feynman.MaxTranscriptChars,
+		},
+		log,
+	)
+	log.Info("语音费曼练习已启用", "stt_provider", feynmanService.STTProviderName())
+	if cfg.Feynman.Evaluation.Enabled && retrievalService != nil {
+		evaluationModel := cfg.Feynman.Evaluation.Model
+		if evaluationModel == "" {
+			evaluationModel = cfg.DeepSeek.Model
+		}
+		evaluationClient := llm.NewDeepSeekClient(
+			cfg.DeepSeek.APIKey,
+			cfg.DeepSeek.BaseURL,
+			evaluationModel,
+			0,
+			time.Duration(cfg.Feynman.Evaluation.TimeoutSeconds)*time.Second,
+		)
+		evaluator, err := service.LoadLLMFeynmanEvaluator(
+			cfg.Feynman.Evaluation.PromptPath,
+			cfg.Feynman.Evaluation.PromptVersion,
+			evaluationModel,
+			evaluationClient,
+		)
+		if err != nil {
+			return err
+		}
+		feynmanService.WithEvaluation(store.NewPostgresFeynmanRepository(db), evaluator, retrievalService)
+		log.Info("费曼证据评估已启用", "prompt_version", cfg.Feynman.Evaluation.PromptVersion, "model", evaluationModel)
+	} else {
+		log.Info("费曼证据评估未启用或可信检索不可用")
+	}
+
+	// 对话式费曼学习：练习是聊天里的一种会话状态，不是独立页面。
+	// 它挂在 ChatService 的最前面，未启用时聊天链路完全不受影响。
+	var feynmanDialogService *service.FeynmanDialogService
+	if cfg.Feynman.Dialog.Enabled {
+		dialogModel := cfg.Feynman.Dialog.Model
+		if dialogModel == "" {
+			dialogModel = cfg.DeepSeek.Model
+		}
+		dialogClient := llm.NewDeepSeekClient(
+			cfg.DeepSeek.APIKey,
+			cfg.DeepSeek.BaseURL,
+			dialogModel,
+			0,
+			time.Duration(cfg.Feynman.Dialog.TimeoutSeconds)*time.Second,
+		)
+		analyzer, err := service.LoadLLMFeynmanAnswerAnalyzer(
+			cfg.Feynman.Dialog.PromptPath,
+			cfg.Feynman.Dialog.PromptVersion,
+			dialogModel,
+			dialogClient,
+		)
+		if err != nil {
+			return err
+		}
+		// retrievalService 为 nil 时按“未启用检索”处理：分析照常进行，
+		// 但上下文里会明确写着没有资料，模型不会因此编造引用。
+		var dialogRetriever service.ChatRetriever
+		if retrievalService != nil {
+			dialogRetriever = retrievalService
+		}
+		feynmanDialogService = service.NewFeynmanDialogService(
+			store.NewPostgresFeynmanPracticeRepository(db),
+			analyzer,
+			dialogRetriever,
+			service.FeynmanDialogLimits{
+				MaxControlPhraseRunes: cfg.Feynman.Dialog.MaxControlPhraseRunes,
+				MaxTopicRunes:         cfg.Feynman.Dialog.MaxTopicRunes,
+				MaxProbeRunes:         cfg.Feynman.Dialog.MaxProbeRunes,
+				MaxGaps:               cfg.Feynman.Dialog.MaxGaps,
+				MaxSecondaryGaps:      cfg.Feynman.Dialog.MaxSecondaryGaps,
+				MaxContextTurns:       cfg.Feynman.Dialog.MaxContextTurns,
+				MaxAnswerRunes:        cfg.Feynman.Dialog.MaxAnswerRunes,
+			},
+			log,
+		)
+		chatService.WithPractice(feynmanDialogService)
+		log.Info("对话式费曼学习已启用", "prompt_version", cfg.Feynman.Dialog.PromptVersion, "model", dialogModel)
+	} else {
+		log.Info("对话式费曼学习未启用（FEYNMAN_DIALOG_ENABLED=false）")
+	}
+
+	// 通用语音输入：普通对话输入区的 Push-to-Talk。
+	// 它和上面的语音费曼练习共用同一个 sttProvider 实例：同一套供应商配置只存一份，
+	// 避免两处配置飘移后“这里能转写那里不能”这种排查起来最费劲的问题。
+	var voiceService *service.VoiceCaptureService
+	if cfg.Voice.Enabled {
+		// 词表加载失败不阻断启动：它只影响“术语可能被听错”这一条提示，
+		// 转写失败、置信度偏低这两条更硬的拦截仍然生效。
+		glossary, glossaryErr := service.LoadTermGlossary(cfg.Voice.GlossaryPath)
+		if glossaryErr != nil {
+			log.Warn("语音术语词表加载失败，术语歧义提示已关闭", "path", cfg.Voice.GlossaryPath, "error", glossaryErr)
+			glossary = nil
+		}
+		voiceService = service.NewVoiceCaptureService(
+			store.NewPostgresVoiceCaptureRepository(db),
+			sttProvider,
+			glossary,
+			service.VoiceLimits{
+				MaxAudioBytes:      cfg.Voice.MaxAudioBytes,
+				MaxDurationMS:      cfg.Voice.MaxDurationMS,
+				MaxTranscriptChars: cfg.Voice.MaxTranscriptChars,
+				MinConfidence:      cfg.Voice.MinConfidence,
+				MaxAmbiguousTerms:  cfg.Voice.MaxAmbiguousTerms,
+				TranscribingStale:  time.Duration(cfg.Voice.TranscribingStaleSecond) * time.Second,
+			},
+			log,
+		)
+		log.Info("通用语音输入已启用",
+			"stt_provider", voiceService.STTProviderName(),
+			"glossary_terms", glossary.Size(),
+			"min_confidence", cfg.Voice.MinConfidence)
+	} else {
+		log.Info("通用语音输入未启用（VOICE_ENABLED=false）")
+	}
+
+	// 语音合成：把费曼提问和追问念出来。未配置密钥时直接不注册接口，
+	// 而不是像 STT 那样造一个占位实现：念一段占位音频没任何价值，没有声音就看文字即可。
+	var speechService *service.SpeechService
+	if cfg.Speech.Enabled && cfg.Speech.APIKey != "" {
+		speechService = service.NewSpeechService(
+			tts.NewMiMoProvider(
+				cfg.Speech.APIKey,
+				cfg.Speech.BaseURL,
+				cfg.Speech.Model,
+				cfg.Speech.Voice,
+				time.Duration(cfg.Speech.TimeoutSeconds)*time.Second,
+			),
+			service.SpeechLimits{
+				MaxTextRunes: cfg.Speech.MaxTextRunes,
+				StyleHint:    cfg.Speech.StyleHint,
+			},
+			log,
+		)
+		log.Info("语音合成已启用",
+			"tts_provider", speechService.ProviderName(),
+			"model", cfg.Speech.Model,
+			"voice", cfg.Speech.Voice)
+	} else if cfg.Speech.Enabled {
+		log.Info("语音合成未启用（未配置 SPEECH_API_KEY）")
+	} else {
+		log.Info("语音合成未启用（SPEECH_ENABLED=false）")
+	}
+
+	srvHandler := handler.NewServer(chatService, identityService, sessionService, messageService, turnLeaseService, documentService, candidateService, retrievalService, feynmanService, feynmanDialogService, voiceService, speechService, memoryPipeline, cfg.Identity, log).Handler()
 	srv := &http.Server{
 		Addr:              ":" + cfg.HTTP.Port,
 		Handler:           srvHandler,

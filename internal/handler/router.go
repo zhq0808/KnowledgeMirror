@@ -26,14 +26,22 @@ type Server struct {
 	documents      *service.DocumentService
 	candidates     *service.CandidateService
 	retrieval      *service.RetrievalService
+	feynman        *service.FeynmanService
+	practice       *service.FeynmanDialogService
+	voice          *service.VoiceCaptureService
+	speech         *service.SpeechService
 	memory         memoryNotifier
 	identityConfig config.IdentityConfig
 	log            *slog.Logger
 	engine         *gin.Engine
 }
 
-// NewServer 构建 HTTP Server 并注册路由与中间件。memory 可为 nil（关闭异步抽取时不投递）。
-func NewServer(chat *service.ChatService, identity *service.IdentityService, sessions *service.SessionService, messages *service.MessageService, turnLeases *service.TurnLeaseService, documents *service.DocumentService, candidates *service.CandidateService, retrieval *service.RetrievalService, memory memoryNotifier, identityConfig config.IdentityConfig, log *slog.Logger) *Server {
+// NewServer 构建 HTTP Server 并注册路由与中间件。memory 可为 nil（关闭异步抽取时不投递）；
+// feynman 可为 nil（未配置 STT/知识点时语音费曼练习接口不注册）；
+// practice 可为 nil（未启用对话式费曼学习时不下发练习状态）；
+// voice 可为 nil（未配置 STT 或关闭语音输入时录音接口不注册）；
+// speech 可为 nil（未配置 TTS 或关闭语音合成时朗读接口不注册）。
+func NewServer(chat *service.ChatService, identity *service.IdentityService, sessions *service.SessionService, messages *service.MessageService, turnLeases *service.TurnLeaseService, documents *service.DocumentService, candidates *service.CandidateService, retrieval *service.RetrievalService, feynman *service.FeynmanService, practice *service.FeynmanDialogService, voice *service.VoiceCaptureService, speech *service.SpeechService, memory memoryNotifier, identityConfig config.IdentityConfig, log *slog.Logger) *Server {
 	gin.SetMode(gin.ReleaseMode)
 	s := &Server{
 		chat:           chat,
@@ -44,6 +52,10 @@ func NewServer(chat *service.ChatService, identity *service.IdentityService, ses
 		documents:      documents,
 		candidates:     candidates,
 		retrieval:      retrieval,
+		feynman:        feynman,
+		practice:       practice,
+		voice:          voice,
+		speech:         speech,
 		memory:         memory,
 		identityConfig: identityConfig,
 		log:            log,
@@ -76,7 +88,18 @@ func (s *Server) routes() {
 	s.engine.Use(traceMiddleware())
 	s.engine.Use(recoverMiddleware(s.log))
 	s.engine.Use(accessLogMiddleware(s.log))
-	s.engine.Use(bodyLimitMiddlewareExcept(maxBodyBytes, http.MethodPost, "/api/v1/documents"))
+	// 全局请求体上限；资料上传和录音上传路径由各自的路由级中间件放宽到更大的上限，
+	// 这里必须跳过它们，否则内层 http.MaxBytesReader 仍会被外层的小上限截断。
+	s.engine.Use(func(c *gin.Context) {
+		if c.Request.Method == http.MethodPost &&
+			(c.Request.URL.Path == "/api/v1/documents" ||
+				c.Request.URL.Path == voiceCapturePath ||
+				isFeynmanAudioUploadPath(c.Request.URL.Path)) {
+			c.Next()
+			return
+		}
+		bodyLimitMiddleware(maxBodyBytes)(c)
+	})
 
 	s.engine.NoRoute(func(c *gin.Context) {
 		fail(c, http.StatusNotFound, CodeNotFound, "接口不存在")
@@ -98,6 +121,28 @@ func (s *Server) routes() {
 		protected.GET("/sessions", s.listSessionsHandler)
 		protected.GET("/sessions/:session_id/messages", s.listSessionMessagesHandler)
 		protected.POST("/chat/stream", s.chatStreamHandler)
+
+		// 对话式费曼学习：只读当前会话的练习状态，供刷新/切会话后恢复状态条。
+		// 练习本身没有任何写接口：开始/暂停/跳过全部走 /chat/stream 的自然语言。
+		if s.practice != nil {
+			protected.GET("/feynman/practice-state", s.getFeynmanPracticeStateHandler)
+		}
+
+		// 通用语音输入：只负责把录音转成文本，转完仍旧由 /chat/stream 承接，
+		// 文字和语音共用同一套分析流程，这里不存在第二条业务链路。
+		if s.voice != nil {
+			voice := protected.Group("/voice")
+			voice.POST("/captures",
+				bodyLimitMiddleware(feynmanAudioBodyLimitBytes(s.voice.Limits().MaxAudioBytes)),
+				s.createVoiceCaptureHandler)
+			voice.GET("/captures/:capture_id", s.getVoiceCaptureHandler)
+		}
+
+		// 语音合成：把已经展示给用户的费曼提问念出来。
+		// 只输出音频，不写入任何状态；调不通时前端退回纯文字，不阻断练习。
+		if s.speech != nil {
+			protected.POST("/speech", s.createSpeechHandler)
+		}
 
 		// 资料治理：上传、解析、版本、来源片段、用途确认。
 		// 这些接口只改变资料状态，不产生知识点，也不改变任何掌握状态。
@@ -138,6 +183,23 @@ func (s *Server) routes() {
 		// 不改变任何资料状态，也不产生任何掌握状态。
 		if s.retrieval != nil {
 			protected.POST("/retrieval/preview", s.retrievalPreviewHandler)
+		}
+
+		// 语音费曼练习：录音、转写确认、版本化 Rubric、可信来源评估与人工证据决策。
+		if s.feynman != nil {
+			attempts := protected.Group("/feynman/attempts")
+			attempts.POST("", s.createFeynmanAttemptHandler)
+			attempts.GET("/:attempt_id", s.getFeynmanAttemptHandler)
+			attempts.POST("/:attempt_id/audio",
+				bodyLimitMiddleware(feynmanAudioBodyLimitBytes(s.feynman.Limits().MaxAudioBytes)),
+				s.uploadFeynmanAudioHandler)
+			attempts.POST("/:attempt_id/confirm", s.confirmFeynmanTranscriptHandler)
+			attempts.POST("/:attempt_id/evaluate", s.evaluateFeynmanAttemptHandler)
+			attempts.GET("/:attempt_id/evaluation", s.getFeynmanEvaluationHandler)
+			protected.POST("/feynman/evaluations/:evaluation_id/decision", s.decideFeynmanEvaluationHandler)
+
+			protected.GET("/knowledge-points/:knowledge_point_id/rubric", s.getFeynmanRubricHandler)
+			protected.POST("/knowledge-points/:knowledge_point_id/rubric/versions", s.createFeynmanRubricVersionHandler)
 		}
 	}
 }

@@ -20,7 +20,92 @@ type Config struct {
 	Document  DocumentConfig  `yaml:"document"  env-prefix:"DOCUMENT_"`
 	Candidate CandidateConfig `yaml:"candidate" env-prefix:"CANDIDATE_"`
 	Retrieval RetrievalConfig `yaml:"retrieval" env-prefix:"RETRIEVAL_"`
+	Feynman   FeynmanConfig   `yaml:"feynman"   env-prefix:"FEYNMAN_"`
+	Voice     VoiceConfig     `yaml:"voice"     env-prefix:"VOICE_"`
+	Speech    SpeechConfig    `yaml:"speech"    env-prefix:"SPEECH_"`
 	Log       LogConfig       `yaml:"log"       env-prefix:"LOG_"`
+}
+
+// SpeechConfig 控制文字转语音（TTS）：让费曼提问和追问出声，模拟面试官开口发问。
+//
+// 与语音输入相反，这条链路上的文本全部由本系统生成，不含用户上传内容，
+// 因此没有可信度问题；这里的上限只用于防御性地控制单次合成的开销。
+type SpeechConfig struct {
+	Enabled bool   `yaml:"enabled"         env:"ENABLED"         env-default:"true"`
+	APIKey  string `yaml:"-"               env:"API_KEY"`
+	BaseURL string `yaml:"base_url"        env:"BASE_URL"        env-default:"https://api.xiaomimimo.com/v1"`
+	Model   string `yaml:"model"           env:"MODEL"           env-default:"mimo-v2.5-tts"`
+	Voice   string `yaml:"voice"           env:"VOICE"           env-default:"冰糖"`
+	// StyleHint 是念稿风格指令，会作为 user 消息传给模型，不会被念出来。
+	StyleHint      string `yaml:"style_hint"      env:"STYLE_HINT"`
+	MaxTextRunes   int    `yaml:"max_text_runes"  env:"MAX_TEXT_RUNES"  env-default:"600"`
+	TimeoutSeconds int    `yaml:"timeout_seconds" env:"TIMEOUT_SECONDS" env-default:"60"`
+}
+
+// VoiceConfig 控制普通对话输入区的 Push-to-Talk 语音输入。
+//
+// 注意这里没有 STT 供应商配置：语音输入与语音费曼练习共用 feynman.stt.*，
+// 同一个供应商实例注入两个服务。拆成两套只会制造“换了一处忘了另一处”的配置陷阱。
+type VoiceConfig struct {
+	Enabled                 bool    `yaml:"enabled"                   env:"ENABLED"                   env-default:"true"`
+	MaxAudioBytes           int64   `yaml:"max_audio_bytes"           env:"MAX_AUDIO_BYTES"           env-default:"6291456"`
+	MaxDurationMS           int     `yaml:"max_duration_ms"           env:"MAX_DURATION_MS"           env-default:"180000"`
+	MaxTranscriptChars      int     `yaml:"max_transcript_chars"      env:"MAX_TRANSCRIPT_CHARS"      env-default:"8000"`
+	MinConfidence           float64 `yaml:"min_confidence"            env:"MIN_CONFIDENCE"            env-default:"0.6"`
+	MaxAmbiguousTerms       int     `yaml:"max_ambiguous_terms"       env:"MAX_AMBIGUOUS_TERMS"       env-default:"5"`
+	GlossaryPath            string  `yaml:"glossary_path"             env:"GLOSSARY_PATH"             env-default:"prompts/voice_glossary_v1.txt"`
+	TranscribingStaleSecond int     `yaml:"transcribing_stale_seconds" env:"TRANSCRIBING_STALE_SECONDS" env-default:"120"`
+}
+
+// FeynmanSTTConfig 控制语音费曼练习的 STT 供应商接入。
+// APIKey 为空时自动降级为 local_placeholder，服务正常启动，仅在日志中提示。
+type FeynmanSTTConfig struct {
+	// Provider 取值 mimo_asr 或 openai_whisper。
+	// 两家协议完全不同（前者是 chat/completions 内联 Base64，后者是 multipart 文件上传），
+	// 不能靠 base_url 兼容，必须显式选择。
+	Provider string `yaml:"provider"        env:"PROVIDER"        env-default:"mimo_asr"`
+	APIKey   string `yaml:"-"               env:"API_KEY"`
+	BaseURL  string `yaml:"base_url"        env:"BASE_URL"        env-default:"https://api.xiaomimimo.com/v1"`
+	Model    string `yaml:"model"           env:"MODEL"           env-default:"mimo-v2.5-asr"`
+	// Language 取值 auto / zh / en，仅 mimo_asr 使用。明确语种能提升识别准确率。
+	Language       string `yaml:"language"        env:"LANGUAGE"        env-default:"zh"`
+	TimeoutSeconds int    `yaml:"timeout_seconds" env:"TIMEOUT_SECONDS" env-default:"60"`
+}
+
+// FeynmanConfig 控制语音费曼练习 v0 的 Push-to-Talk 录音硬上限与 STT 接入。
+// 这些都是防御性预算：一次异常录音不能撑爆一条数据库行或占满请求处理时间。
+type FeynmanConfig struct {
+	MaxAudioBytes      int64                   `yaml:"max_audio_bytes"       env:"MAX_AUDIO_BYTES"       env-default:"6291456"`
+	MaxDurationMS      int                     `yaml:"max_duration_ms"       env:"MAX_DURATION_MS"       env-default:"180000"`
+	MaxTranscriptChars int                     `yaml:"max_transcript_chars"  env:"MAX_TRANSCRIPT_CHARS"  env-default:"8000"`
+	STT                FeynmanSTTConfig        `yaml:"stt"                   env-prefix:"STT_"`
+	Evaluation         FeynmanEvaluationConfig `yaml:"evaluation"      env-prefix:"EVALUATION_"`
+	Dialog             FeynmanDialogConfig     `yaml:"dialog"          env-prefix:"DIALOG_"`
+}
+
+// FeynmanDialogConfig 控制对话式费曼学习：同一个聊天框里的“提问 → 回答 → 分析 → 追问”闭环。
+// 这些同样是防御性预算：调大只会让一次反馈更长，不会绕过越权、引用核对等任何边界。
+type FeynmanDialogConfig struct {
+	Enabled               bool   `yaml:"enabled"                  env:"ENABLED"                  env-default:"true"`
+	Model                 string `yaml:"model"                    env:"MODEL"`
+	PromptVersion         string `yaml:"prompt_version"           env:"PROMPT_VERSION"           env-default:"feynman-analysis-v2"`
+	PromptPath            string `yaml:"prompt_path"              env:"PROMPT_PATH"              env-default:"prompts/feynman_analysis_v2.tmpl"`
+	TimeoutSeconds        int    `yaml:"timeout_seconds"          env:"TIMEOUT_SECONDS"          env-default:"60"`
+	MaxTopicRunes         int    `yaml:"max_topic_runes"          env:"MAX_TOPIC_RUNES"          env-default:"120"`
+	MaxProbeRunes         int    `yaml:"max_probe_runes"          env:"MAX_PROBE_RUNES"          env-default:"120"`
+	MaxControlPhraseRunes int    `yaml:"max_control_phrase_runes" env:"MAX_CONTROL_PHRASE_RUNES" env-default:"16"`
+	MaxGaps               int    `yaml:"max_gaps"                 env:"MAX_GAPS"                 env-default:"5"`
+	MaxSecondaryGaps      int    `yaml:"max_secondary_gaps"       env:"MAX_SECONDARY_GAPS"       env-default:"3"`
+	MaxContextTurns       int    `yaml:"max_context_turns"        env:"MAX_CONTEXT_TURNS"        env-default:"6"`
+	MaxAnswerRunes        int    `yaml:"max_answer_runes"         env:"MAX_ANSWER_RUNES"         env-default:"6000"`
+}
+
+type FeynmanEvaluationConfig struct {
+	Enabled        bool   `yaml:"enabled"         env:"ENABLED"         env-default:"true"`
+	Model          string `yaml:"model"           env:"MODEL"`
+	PromptVersion  string `yaml:"prompt_version"  env:"PROMPT_VERSION"  env-default:"feynman-evaluator-v1"`
+	PromptPath     string `yaml:"prompt_path"     env:"PROMPT_PATH"     env-default:"prompts/feynman_evaluator_v1.tmpl"`
+	TimeoutSeconds int    `yaml:"timeout_seconds" env:"TIMEOUT_SECONDS" env-default:"60"`
 }
 
 // RetrievalConfig 控制 Agent 知识库检索 v0。

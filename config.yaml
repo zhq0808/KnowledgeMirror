@@ -62,6 +62,71 @@ retrieval:
   max_chunk_chars: 1200           # 单个片段进入 Prompt 的字符上限，超出显式标注截断
   context_budget_chars: 4000      # 检索上下文总预算
 
+# 语音费曼练习 v0：录音上传 -> STT 转写 -> 用户确认；以及知识点版本化 Rubric。
+# 音频上限均为防御性预算；确认转写和 Rubric 本身都不产生掌握状态或证据。
+feynman:
+  max_audio_bytes: 6291456        # 6 MiB
+  max_duration_ms: 180000         # 3 分钟
+  max_transcript_chars: 8000
+  stt:
+    provider: "mimo_asr"                    # mimo_asr | openai_whisper；两家协议不兼容，不能只改 base_url
+    base_url: "https://api.xiaomimimo.com/v1"
+    model: "mimo-v2.5-asr"
+    language: "zh"                          # auto | zh | en；明确语种识别更准
+    timeout_seconds: 60
+    # ⚠ mimo_asr 仅接受 wav / mp3，Base64 后不超 10 MB；浏览器默认的 webm/opus 必须先转成 wav。
+    # api_key 走 .env 的 FEYNMAN_STT_API_KEY；未配置时自动降级为 local_placeholder，服务正常启动。
+  evaluation:
+    enabled: true
+    model: "deepseek/deepseek-v4-flash"
+    prompt_version: "feynman-evaluator-v1"
+    prompt_path: "prompts/feynman_evaluator_v1.tmpl"
+    timeout_seconds: 60
+  # 对话式费曼学习：同一个聊天框里的“提问 -> 回答 -> 分析 -> 追问”，不切页面、不填表单。
+  dialog:
+    enabled: true
+    model: "deepseek/deepseek-v4-flash"
+    prompt_version: "feynman-analysis-v2"
+    prompt_path: "prompts/feynman_analysis_v2.tmpl"
+    timeout_seconds: 60
+    max_topic_runes: 120           # 用户自述主题的长度上限
+    max_probe_runes: 120           # AI 追问的长度上限
+    max_control_phrase_runes: 16   # 超过这个长度就不再当“暂停/跳过”等控制词，防止吞掉真实回答
+    max_gaps: 5                    # 一次分析最多产出几条缺口（后续全量进薄弱点账本）
+    max_secondary_gaps: 3          # 一次反馈里除“最关键错误”外最多展示几条，剩下的只提示条数
+    max_context_turns: 6           # 进入分析的最近对话轮数
+    max_answer_runes: 6000         # 进入分析的回答长度上限
+
+# 通用语音输入：普通对话输入区的 Push-to-Talk。
+# 语音只负责把这句话变成文字，之后走的是和打字完全相同的一条链路，
+# 因此这里没有任何分析参数，也不会产生掌握状态。
+# STT 供应商复用 feynman.stt.*，不在这里重复配置。
+voice:
+  enabled: true
+  max_audio_bytes: 6291456        # 6 MiB
+  max_duration_ms: 180000         # 3 分钟，前端到点自动停止录音
+  max_transcript_chars: 8000
+  min_confidence: 0.6             # 低于此值先让用户确认再发送；拿不到置信度同样要确认
+  max_ambiguous_terms: 5          # 单次最多提示几个疑似听错的术语
+  glossary_path: "prompts/voice_glossary_v1.txt"
+  transcribing_stale_seconds: 120 # 超过此时长仍卡在 transcribing 的记录允许被重试接管
+
+# 文字转语音（TTS）：让费曼提问和追问出声，把“实时 + 用耳朵听 + 有人等”的面试条件复现出来。
+# 念的文本全部由本系统生成，不含用户上传内容，因此不需要可信度判断。
+speech:
+  enabled: true
+  base_url: "https://api.xiaomimimo.com/v1"
+  model: "mimo-v2.5-tts"
+  # voice 必须是单个音色 ID，不能写成候选列表，否则会被原样发给 API 报错。
+  # 可选：冰糖 / 茉莉（女，中文）、苏打 / 白桦（男，中文）、Mia / Chloe（女，英文）、Milo / Dean（男，英文）
+  voice: "冰糖"
+  # 风格指令会作为 user 消息传给模型指导“怎么念”，不会被念出来。
+  # 必须和 voice 的性别一致：MiMo 明确要求不要给互相矛盾的特征（女声配"中年男性"会互相打架）。
+  style_hint: "沉稳干练的女性技术面试官，语速平缓，咬字清楚，不带多余情绪，句尾略往下沉。"
+  max_text_runes: 600             # 单次合成文本上限，防御性开销控制
+  timeout_seconds: 60
+  # api_key 走 .env 的 SPEECH_API_KEY；未配置时语音合成自动关闭，服务正常启动。
+
 log:
   level: "info"   # debug | info | warn | error
   # debug=true 时才允许打印敏感原文，仅限本地，线上禁止开启
