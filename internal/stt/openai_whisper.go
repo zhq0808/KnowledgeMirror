@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime/multipart"
 	"net/http"
 	"strings"
@@ -17,6 +18,8 @@ import (
 // “OpenAI 兼容”指很多供应商（含国内中转服务）都实现了同一套
 // multipart/form-data `/audio/transcriptions` 协议，因此 BaseURL 可配置为任意兼容端点。
 const OpenAIWhisperProviderName = "openai_whisper"
+
+const maxWhisperResponseBytes = 1 << 20
 
 // ErrNotConfigured 表示未配置 API Key，调用方应改用 LocalPlaceholderProvider。
 var ErrNotConfigured = errors.New("STT 供应商未配置 API Key")
@@ -81,6 +84,12 @@ func (p *OpenAIWhisperProvider) Transcribe(ctx context.Context, audio []byte, mi
 	if err := writer.WriteField("model", p.model); err != nil {
 		return Transcript{}, fmt.Errorf("构造转写请求失败: %w", err)
 	}
+	// verbose_json 多返回 segments（含 avg_logprob），是算置信度的唯一依据。
+	// 很多 OpenAI 兼容中转端点会忽略这个参数只回 {"text":...}，
+	// 那种情况下解析仍然成立，只是拿不到置信度（返回 nil）。
+	if err := writer.WriteField("response_format", "verbose_json"); err != nil {
+		return Transcript{}, fmt.Errorf("构造转写请求失败: %w", err)
+	}
 	if err := writer.Close(); err != nil {
 		return Transcript{}, fmt.Errorf("构造转写请求失败: %w", err)
 	}
@@ -98,28 +107,78 @@ func (p *OpenAIWhisperProvider) Transcribe(ctx context.Context, audio []byte, mi
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxWhisperResponseBytes+1))
 	if err != nil {
 		return Transcript{}, fmt.Errorf("读取 STT 响应失败: %w", err)
+	}
+	if len(respBody) > maxWhisperResponseBytes {
+		return Transcript{}, fmt.Errorf("STT 响应超过 %d 字节上限", maxWhisperResponseBytes)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return Transcript{}, fmt.Errorf("STT 供应商返回错误状态 %d: %s", resp.StatusCode, truncateForError(respBody))
 	}
 
 	var parsed struct {
-		Text string `json:"text"`
+		Text     string `json:"text"`
+		Segments []struct {
+			Start      float64 `json:"start"`
+			End        float64 `json:"end"`
+			AvgLogprob float64 `json:"avg_logprob"`
+		} `json:"segments"`
 	}
 	if err := json.Unmarshal(respBody, &parsed); err != nil {
 		return Transcript{}, fmt.Errorf("解析 STT 响应失败: %w", err)
 	}
 	requestID := resp.Header.Get("x-request-id")
 
+	segments := make([]Segment, 0, len(parsed.Segments))
+	for _, s := range parsed.Segments {
+		segments = append(segments, Segment{Start: s.Start, End: s.End, AvgLogprob: s.AvgLogprob})
+	}
+
 	return Transcript{
-		Text:      strings.TrimSpace(parsed.Text),
-		Provider:  OpenAIWhisperProviderName,
-		Model:     p.model,
-		RequestID: requestID,
+		Text:       strings.TrimSpace(parsed.Text),
+		Provider:   OpenAIWhisperProviderName,
+		Model:      p.model,
+		RequestID:  requestID,
+		Confidence: SegmentConfidence(segments),
 	}, nil
+}
+
+// Segment 是 Whisper verbose_json 返回的一段转写区间。
+type Segment struct {
+	Start      float64
+	End        float64
+	AvgLogprob float64 // 该区间内 token 对数概率均值，≤ 0，越接近 0 越确定
+}
+
+// SegmentConfidence 把 Whisper 的 avg_logprob 折算成 0-1 的整体置信度。
+//
+// 按区间时长加权而不是简单平均：一段长讲解里夹杂的“嗯”“那个”会被切成很多
+// 极短且低分的片段，简单平均会被它们拉得很难看，导致明明听清楚了却反复要求用户确认。
+// 无 segments（供应商不支持 verbose_json）时返回 nil，由业务层按“没有把握”处理。
+func SegmentConfidence(segments []Segment) *float64 {
+	if len(segments) == 0 {
+		return nil
+	}
+	var weightedSum, totalWeight float64
+	for _, segment := range segments {
+		weight := segment.End - segment.Start
+		if weight <= 0 {
+			weight = 1 // 时间戳异常时退化为等权，不丢弃这段
+		}
+		weightedSum += segment.AvgLogprob * weight
+		totalWeight += weight
+	}
+	if totalWeight <= 0 {
+		return nil
+	}
+	confidence := math.Exp(weightedSum / totalWeight)
+	if math.IsNaN(confidence) {
+		return nil
+	}
+	confidence = math.Max(0, math.Min(1, confidence))
+	return &confidence
 }
 
 // truncateForError 避免把过长的供应商错误响应整体塞进错误信息和日志。

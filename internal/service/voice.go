@@ -1,0 +1,311 @@
+package service
+
+import (
+	"context"
+	"crypto/sha256"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"healthAgent/internal/stt"
+)
+
+// ---------------------------------------------------------------------------
+// 通用语音输入 v0：Push-to-Talk -> STT 转写 -> 决定是否需要用户确认。
+//
+// 这里刻意只做「把声音变成文本」这一件事。转写完成后，这段文本走的是和打字
+// 完全相同的一条链路（/chat/stream -> 费曼对话服务），所以本文件里不存在任何
+// 费曼分析逻辑，也不产生任何掌握状态或掌握证据 —— 说了话不等于讲对了。
+//
+// 与费曼练习里那套语音（FeynmanService.UploadAudio）的区别：那套绑在练习尝试上，
+// 是「一次正式作答」；这套绑在会话上，是「输入法」。两者共用同一个 stt.Provider 实例。
+// ---------------------------------------------------------------------------
+
+// 录音任务状态。v0 同步调用 STT，返回时已是 transcribed/failed 终态；
+// uploaded/transcribing 是过程态，只有崩溃时才会留在库里，由过期接管兜底。
+const (
+	VoiceCaptureStatusUploaded     = "uploaded"
+	VoiceCaptureStatusTranscribing = "transcribing"
+	VoiceCaptureStatusTranscribed  = "transcribed"
+	VoiceCaptureStatusFailed       = "failed"
+)
+
+// 要求用户先确认再发送的原因。空字符串表示本次可以直接自动发送。
+// 顺序即优先级：转写失败 > 拿不到置信度 > 置信度偏低 > 术语疑似听错。
+const (
+	VoiceConfirmReasonTranscribeFailed  = "transcribe_failed"
+	VoiceConfirmReasonMissingConfidence = "missing_confidence"
+	VoiceConfirmReasonLowConfidence     = "low_confidence"
+	VoiceConfirmReasonAmbiguousTerms    = "ambiguous_terms"
+)
+
+// ErrVoiceCaptureNotFound 表示录音记录不存在或不属于当前用户/会话。
+var ErrVoiceCaptureNotFound = errors.New("语音记录不存在")
+
+// VoiceInputError 是可以安全回显给用户的输入/预算类错误，接口层映射为 400。
+type VoiceInputError struct{ Message string }
+
+func (e *VoiceInputError) Error() string { return e.Message }
+
+func invalidVoiceInput(format string, args ...any) error {
+	return &VoiceInputError{Message: fmt.Sprintf(format, args...)}
+}
+
+// VoiceCapture 是一次录音及其转写结果。
+//
+// RawTranscript 是不可信输入：它没有被任何人确认过，不得直接当作用户的正式表达，
+// 更不能作为掌握证据。真正被发送出去的文本是聊天消息本身，通过 MessageID 关联。
+type VoiceCapture struct {
+	CaptureID          string
+	UserID             string
+	SessionID          string
+	Status             string
+	MIMEType           string
+	SizeBytes          int64
+	DurationMs         *int
+	STTProvider        string
+	STTModel           string
+	STTRequestID       string
+	RawTranscript      string
+	Confidence         *float64
+	AmbiguousTerms     []AmbiguousTerm
+	NeedsConfirmation  bool
+	ConfirmationReason string
+	TranscriptError    string
+	MessageID          string
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
+}
+
+// ClaimVoiceCaptureParams 是抢占一次转写任务所需的全部参数。
+type ClaimVoiceCaptureParams struct {
+	CaptureID   string
+	UserID      string
+	SessionID   string
+	MIMEType    string
+	SizeBytes   int64
+	DurationMs  *int
+	SHA256      []byte
+	AudioData   []byte
+	STTProvider string
+	// StaleBefore 之前仍停在 transcribing 的记录视为上次调用崩溃，允许本次接管重试。
+	StaleBefore time.Time
+}
+
+// CompleteVoiceCaptureParams 写入一次转写的终态结果。
+type CompleteVoiceCaptureParams struct {
+	CaptureID          string
+	UserID             string
+	Status             string
+	STTProvider        string
+	STTModel           string
+	STTRequestID       string
+	RawTranscript      string
+	Confidence         *float64
+	AmbiguousTerms     []AmbiguousTerm
+	NeedsConfirmation  bool
+	ConfirmationReason string
+	TranscriptError    string
+}
+
+// VoiceCaptureRepository 是语音录音的持久化边界。
+type VoiceCaptureRepository interface {
+	// Claim 抢占一次转写。相同用户+会话+字节的重复提交命中去重记录并返回 claimed=false，
+	// 由调用方直接复用已有结果，不重复调用 STT（不重复计费）。
+	Claim(ctx context.Context, params ClaimVoiceCaptureParams) (VoiceCapture, bool, error)
+	// Complete 写入终态，仅当记录仍处于 transcribing 时生效。
+	Complete(ctx context.Context, params CompleteVoiceCaptureParams) (VoiceCapture, error)
+	// Get 按 (user_id, session_id, capture_id) 读取一条录音记录。
+	Get(ctx context.Context, userID, sessionID, captureID string) (VoiceCapture, error)
+	// BindMessage 把转写记录一次性绑定到它最终发出的那条消息上；已绑定过则返回错误。
+	BindMessage(ctx context.Context, userID, sessionID, captureID, messageID string) error
+}
+
+// VoiceLimits 是语音输入的硬上限与判定阈值，全部是防御性预算。
+type VoiceLimits struct {
+	MaxAudioBytes      int64
+	MaxDurationMS      int
+	MaxTranscriptChars int
+	// MinConfidence 是可以自动发送的最低整体置信度；低于它就先让用户看一眼。
+	MinConfidence     float64
+	MaxAmbiguousTerms int
+	TranscribingStale time.Duration
+}
+
+// VoiceCaptureService 实现通用语音输入 v0。
+type VoiceCaptureService struct {
+	repo     VoiceCaptureRepository
+	stt      stt.Provider
+	glossary *TermGlossary
+	limits   VoiceLimits
+	log      *slog.Logger
+}
+
+// NewVoiceCaptureService 构造语音输入服务。glossary 为 nil 时关闭术语歧义检测，
+// 其余判定（转写失败/置信度）不受影响。
+func NewVoiceCaptureService(repo VoiceCaptureRepository, sttProvider stt.Provider, glossary *TermGlossary, limits VoiceLimits, log *slog.Logger) *VoiceCaptureService {
+	if log == nil {
+		log = slog.Default()
+	}
+	if limits.TranscribingStale <= 0 {
+		limits.TranscribingStale = 2 * time.Minute
+	}
+	if limits.MaxAmbiguousTerms <= 0 {
+		limits.MaxAmbiguousTerms = 5
+	}
+	return &VoiceCaptureService{repo: repo, stt: sttProvider, glossary: glossary, limits: limits, log: log}
+}
+
+// Limits 返回当前生效的预算配置，供接口层提前校验请求体大小。
+func (s *VoiceCaptureService) Limits() VoiceLimits { return s.limits }
+
+// STTProviderName 返回当前 STT 供应商标识，供启动日志确认实际生效的供应商。
+func (s *VoiceCaptureService) STTProviderName() string { return s.stt.Name() }
+
+// Capture 接收一段录音并同步完成转写。
+//
+// v0 决策：同步调用 STT，不进异步队列 —— 录音有硬上限，单次转写耗时可控，
+// 而「说完立刻看到文字」是这个功能的全部价值，异步化反而把体验做没了。
+//
+// 无论转写成功还是失败，本方法都返回一条 VoiceCapture 而不是错误：
+// 失败也是一次真实发生过的录音，前端据此提示「转写失败，请改用打字」，
+// 不该让用户以为自己刚才那段话凭空消失了。只有输入不合法或存储故障才返回错误。
+func (s *VoiceCaptureService) Capture(ctx context.Context, userID, sessionID string, audio []byte, mimeType string, durationMs *int) (VoiceCapture, error) {
+	userID = strings.TrimSpace(userID)
+	sessionID = strings.TrimSpace(sessionID)
+	if userID == "" {
+		return VoiceCapture{}, invalidVoiceInput("用户身份缺失")
+	}
+	if sessionID == "" {
+		return VoiceCapture{}, invalidVoiceInput("缺少会话 ID")
+	}
+	if len(audio) == 0 {
+		return VoiceCapture{}, invalidVoiceInput("音频内容为空")
+	}
+	if int64(len(audio)) > s.limits.MaxAudioBytes {
+		return VoiceCapture{}, invalidVoiceInput("音频大小超过上限（%d 字节）", s.limits.MaxAudioBytes)
+	}
+	if !isAllowedFeynmanAudioMIME(mimeType) {
+		return VoiceCapture{}, invalidVoiceInput("不支持的音频格式: %s", mimeType)
+	}
+	if durationMs != nil && (*durationMs <= 0 || *durationMs > s.limits.MaxDurationMS) {
+		return VoiceCapture{}, invalidVoiceInput("录音时长超过上限（%d 毫秒）", s.limits.MaxDurationMS)
+	}
+
+	hash := sha256.Sum256(audio)
+	captureID, err := NewVoiceCaptureID()
+	if err != nil {
+		return VoiceCapture{}, err
+	}
+
+	claimed, won, err := s.repo.Claim(ctx, ClaimVoiceCaptureParams{
+		CaptureID:   captureID,
+		UserID:      userID,
+		SessionID:   sessionID,
+		MIMEType:    mimeType,
+		SizeBytes:   int64(len(audio)),
+		DurationMs:  durationMs,
+		SHA256:      hash[:],
+		AudioData:   audio,
+		STTProvider: s.stt.Name(),
+		StaleBefore: time.Now().Add(-s.limits.TranscribingStale),
+	})
+	if err != nil {
+		return VoiceCapture{}, err
+	}
+	if !won {
+		s.log.Info("命中已有语音记录，跳过重复 STT 调用",
+			"session_id", sessionID, "capture_id", claimed.CaptureID)
+		return claimed, nil
+	}
+
+	params := CompleteVoiceCaptureParams{
+		CaptureID:   claimed.CaptureID,
+		UserID:      userID,
+		STTProvider: s.stt.Name(),
+	}
+	transcript, sttErr := s.stt.Transcribe(ctx, audio, mimeType)
+	switch {
+	case sttErr != nil:
+		// 只记供应商和错误，不记转写文本：这是用户说的话，日志不是它该待的地方。
+		s.log.Warn("语音转写失败", "session_id", sessionID, "capture_id", claimed.CaptureID,
+			"provider", s.stt.Name(), "error", sttErr)
+		params.Status = VoiceCaptureStatusFailed
+		params.TranscriptError = truncateFeynmanError(sttErr.Error(), 2000)
+	default:
+		text := strings.TrimSpace(transcript.Text)
+		switch {
+		case text == "":
+			params.Status = VoiceCaptureStatusFailed
+			params.TranscriptError = "STT 返回空转写文本"
+		case utf8.RuneCountInString(text) > s.limits.MaxTranscriptChars:
+			params.Status = VoiceCaptureStatusFailed
+			params.TranscriptError = fmt.Sprintf("STT 转写超过 %d 字上限", s.limits.MaxTranscriptChars)
+		default:
+			params.Status = VoiceCaptureStatusTranscribed
+			params.RawTranscript = text
+			params.STTProvider = transcript.Provider
+			params.STTModel = transcript.Model
+			params.STTRequestID = transcript.RequestID
+			params.Confidence = transcript.Confidence
+			params.AmbiguousTerms = s.glossary.AmbiguousTerms(text, s.limits.MaxAmbiguousTerms)
+		}
+	}
+	params.NeedsConfirmation, params.ConfirmationReason = s.judgeConfirmation(params)
+
+	// 转写已经花掉了真金白银，落库不能因为用户关掉页面（ctx 被取消）就丢掉。
+	completeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	return s.repo.Complete(completeCtx, params)
+}
+
+// judgeConfirmation 裁决本次是否需要用户确认后再发送，并给出唯一原因。
+//
+// 这是「STT 完成后默认继续分析，仅在置信度低/术语有歧义时暂停」的落地点：
+// 默认值是自动发送，只有下面这几条明确证据才会拦一次。
+// 拿不到置信度（供应商不支持 verbose_json）按需要确认处理 —— 不确定时偏保守，
+// 让用户多按一次回车，好过把听错的话当成他的正式回答喂进分析链路。
+func (s *VoiceCaptureService) judgeConfirmation(params CompleteVoiceCaptureParams) (bool, string) {
+	switch {
+	case params.Status != VoiceCaptureStatusTranscribed:
+		return true, VoiceConfirmReasonTranscribeFailed
+	case params.Confidence == nil:
+		return true, VoiceConfirmReasonMissingConfidence
+	case *params.Confidence < s.limits.MinConfidence:
+		return true, VoiceConfirmReasonLowConfidence
+	case len(params.AmbiguousTerms) > 0:
+		return true, VoiceConfirmReasonAmbiguousTerms
+	default:
+		return false, ""
+	}
+}
+
+// Get 读取一条录音记录，供前端刷新后恢复未发送的转写。
+func (s *VoiceCaptureService) Get(ctx context.Context, userID, sessionID, captureID string) (VoiceCapture, error) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return VoiceCapture{}, invalidVoiceInput("用户身份缺失")
+	}
+	return s.repo.Get(ctx, userID, sessionID, captureID)
+}
+
+// BindMessage 把一段转写和它最终发出的那条消息绑起来。
+//
+// 这条关联就是「保留原始转写与更正版本」的全部实现：原始转写锁在 voice_captures 里，
+// 用户改过的版本是消息内容本身，两份文字都在，谁也没覆盖谁。
+func (s *VoiceCaptureService) BindMessage(ctx context.Context, userID, sessionID, captureID, messageID string) error {
+	userID = strings.TrimSpace(userID)
+	sessionID = strings.TrimSpace(sessionID)
+	captureID = strings.TrimSpace(captureID)
+	messageID = strings.TrimSpace(messageID)
+	if userID == "" || sessionID == "" || captureID == "" || messageID == "" {
+		return invalidVoiceInput("绑定语音记录的参数不完整")
+	}
+	return s.repo.BindMessage(ctx, userID, sessionID, captureID, messageID)
+}
+
+// NewVoiceCaptureID 生成语音记录主键（UUIDv7，按时间有序）。
+func NewVoiceCaptureID() (string, error) { return newUUIDv7("capture_id") }

@@ -1,0 +1,71 @@
+# 语音转写术语词表 v1
+#
+# 用途：Push-to-Talk 转写完成后，用来提示「这段话里可能被听错的技术术语」。
+# 它只产生提示，不修改转写文本、不判断回答对错，也不产生任何掌握状态。
+#
+# 格式：术语|常见误转写1,常见误转写2
+#   - `|` 及之后可以省略；`#` 开头为注释，空行忽略。
+#   - 比较时会统一转小写并去掉空白和标点，所以 "Rocket MQ" 和 "RocketMQ" 视为同一写法，
+#     不需要在误转写里重复登记这类纯格式差异。
+#   - 中文同音误转写检测不出来，必须显式登记（编辑距离对同音字无效）。
+#
+# 维护方式：面试/学习中真的被听错一次，就把那个词补到对应行的后面，属于配置不是代码。
+
+幂等|密等,读百,米等,幂登,免等
+一致性|一次性,一直性
+最终一致|最终一次,最终一直
+状态机|状态基,转态机
+分布式事务|分布式事物,分不是事务
+事务|事物
+消息队列|消息对列
+削峰|消峰,小峰
+限流|现流,线流
+熔断|容断,融断
+降级|讲级
+缓存|换成,缓冲
+穿透|串透
+雪崩|学崩
+回查|会查,回差
+补偿|不偿
+死信队列|死心队列,四信队列
+消费位移|消费位置移
+分区|分去
+副本|付本
+主从复制|主从赋值
+读写分离|读写分利
+索引|锁引
+慢查询|慢察询
+连接池|链接吃
+协程|携程,携成
+goroutine|go routine,狗肉厅
+channel|chanel,channl
+context|contex,康泰克斯
+panic|panik
+defer|defor
+GMP|gmp模型,机mp
+GC|计c
+三色标记|三色表机
+逃逸分析|逃逸分西
+Kafka|卡夫卡,咖啡卡,卡夫卡拉
+RocketMQ|火箭MQ,肉刻特MQ
+Redis|瑞迪斯,redis是
+MySQL|my sql是,买sql
+PostgreSQL|post sql
+Outbox|out box,奥特box
+Saga|撒加,萨嘎
+TCC|tcc模式是,提cc
+CAP|cap理论是,卡普
+BASE|贝斯
+gRPC|g rpc,谷rpc
+RPC|阿pc
+HTTP|h t t p
+JWT|jwt是,J W T
+OAuth|o auth,欧auth
+Nginx|恩静克斯,nginex
+Docker|多克,道客
+Kubernetes|k8s是,库伯内特斯
+Prometheus|普罗米修斯是,prometeus
+Grafana|格拉法纳,grafna
+Embedding|嵌入向量是,embeding
+RAG|rag是,若哥
+pgvector|pg vector,pg向量

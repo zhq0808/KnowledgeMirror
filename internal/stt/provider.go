@@ -12,6 +12,9 @@ type Transcript struct {
 	Provider  string // 供应商标识，如 openai_whisper / local_placeholder
 	Model     string // 供应商侧模型名
 	RequestID string // 供应商侧请求 ID，便于对账和问题排查；供应商不返回时留空
+	// Confidence 是整体置信度（0-1）。供应商不支持或本次没返回可用信息时为 nil；
+	// 调用方必须把 nil 当作“没有把握”，不能当成满分——业务上宁可多让用户确认一次。
+	Confidence *float64
 }
 
 // Provider 是 STT 供应商的统一接口。实现必须是并发安全的（可能被多个请求同时调用）。

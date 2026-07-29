@@ -22,9 +22,13 @@ func NewLocalPlaceholderProvider() *LocalPlaceholderProvider {
 func (p *LocalPlaceholderProvider) Name() string { return LocalPlaceholderProviderName }
 
 func (p *LocalPlaceholderProvider) Transcribe(_ context.Context, _ []byte, _ string) (Transcript, error) {
+	// 置信度固定为 0：占位文案必须永远触发“需要用户确认”，
+	// 绝不能被自动当成用户真的讲了这句话发送出去。
+	zero := 0.0
 	return Transcript{
-		Text:     localPlaceholderText,
-		Provider: LocalPlaceholderProviderName,
-		Model:    "none",
+		Text:       localPlaceholderText,
+		Provider:   LocalPlaceholderProviderName,
+		Model:      "none",
+		Confidence: &zero,
 	}, nil
 }
