@@ -1,8 +1,9 @@
 import { motion } from "motion/react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { BookOpen, RotateCcw, ShieldAlert } from "lucide-react";
+import { BookOpen, LoaderCircle, RotateCcw, ShieldAlert, Square, Volume2 } from "lucide-react";
 import type { RetrievalSources } from "../api/chat";
+import { useSpeechPlayback } from "../lib/useSpeechPlayback";
 
 interface AIMessageProps {
   message: string;
@@ -20,6 +21,7 @@ interface AIMessageProps {
 // 当内容为空（回复尚未吐字）时，显示三个主题绿色的跳动圆点作为“正在输入”指示。
 export function AIMessage({ message, time, failed, onRetry, retrieval }: AIMessageProps) {
   const isTyping = message.trim().length === 0;
+  const speech = useSpeechPlayback();
 
   return (
     <motion.div
@@ -77,8 +79,29 @@ export function AIMessage({ message, time, failed, onRetry, retrieval }: AIMessa
           </>
         )}
       </div>
-      {!isTyping && time && (
-        <span className="mt-1 pl-1 text-[11px] text-muted-foreground">{time}</span>
+      {!isTyping && (
+        <div className="mt-1 flex items-center gap-2 pl-1">
+          {/* 朗读按钮：把提问真正“说”出来，复现「实时 + 用耳朵听 + 有人等」的面试条件。
+              念的是屏幕上这段原文，听到的和看到的永远一致。 */}
+          <button
+            type="button"
+            onClick={() => speech.toggle(message)}
+            disabled={speech.status === "loading"}
+            title={speech.status === "idle" ? "朗读这段" : "停止朗读"}
+            aria-label={speech.status === "idle" ? "朗读这段" : "停止朗读"}
+            className="flex items-center gap-1 rounded-lg text-[11px] text-muted-foreground transition-colors hover:text-primary disabled:opacity-50"
+          >
+            {speech.status === "loading" ? (
+              <LoaderCircle size={12} className="animate-spin" />
+            ) : speech.status === "playing" ? (
+              <Square size={12} className="text-primary" />
+            ) : (
+              <Volume2 size={12} />
+            )}
+          </button>
+          {time && <span className="text-[11px] text-muted-foreground">{time}</span>}
+          {speech.error && <span className="text-[11px] text-amber-700">{speech.error}</span>}
+        </div>
       )}
       {failed && onRetry && (
         <button

@@ -17,6 +17,11 @@ import { Dashboard } from "./components/Dashboard";
 import { BottomNavigation, type AppView } from "./components/BottomNavigation";
 import { KnowledgeBasePage } from "./components/KnowledgeBasePage";
 import { ProfileDashboard } from "./components/ProfileDashboard";
+import { PracticeStatusBar } from "./components/PracticeStatusBar";
+import {
+  getFeynmanPracticeState,
+  type FeynmanPracticeState,
+} from "./api/feynman";
 import {
   createOrResumeGuest,
   ensureSessionID,
@@ -33,6 +38,7 @@ import {
   type SessionMessage,
   type RetrievalSources,
 } from "./api/chat";
+import { uploadVoiceCapture } from "./api/voice";
 import { AuthPage } from "./pages/AuthPage";
 
 interface Message {
@@ -53,7 +59,7 @@ interface Message {
   failed?: boolean;
   // retry 保存失败发送的原始负载：重试时复用同一 client_message_id 命中后端幂等，
   // 避免重复计费/重复落库；只有全新发送才生成新的 UUID。
-  retry?: { clientMessageID: string; text: string };
+  retry?: { clientMessageID: string; text: string; voiceCaptureID?: string };
   retrieval?: RetrievalSources;
 }
 
@@ -152,6 +158,9 @@ function InterviewWorkspace() {
   const [sessionsError, setSessionsError] = useState<string | null>(null);
   const [sessionDrawerOpen, setSessionDrawerOpen] = useState(false);
   const [activeView, setActiveView] = useState<AppView>("practice");
+  // 费曼练习不再是一个前端模式，而是服务端维护的会话状态：
+  // 前端只负责展示，绝不自己推断“现在在不在练习”，否则刷新后两边就对不上了。
+  const [practiceState, setPracticeState] = useState<FeynmanPracticeState | null>(null);
   const [profileOpen, setProfileOpen] = useState(false);
   const [isSending, setIsSending] = useState(false);
   const [selectedModelID, setSelectedModelID] = useState<string>(() =>
@@ -198,6 +207,16 @@ function InterviewWorkspace() {
     }
   };
 
+  // refreshPracticeState 以服务端为准恢复练习状态条（刷新页面、切回旧会话都靠它）。
+  // 读不到就当作没在练习，不弹错：状态条缺一次不影响聊天。
+  const refreshPracticeState = async (sessionID: string) => {
+    try {
+      setPracticeState(await getFeynmanPracticeState(sessionID));
+    } catch {
+      setPracticeState(null);
+    }
+  };
+
   // 启动引导：拉列表 → 校验 localStorage → 选最近会话 → 无会话再创建 → 载入消息。
   useEffect(() => {
     let cancelled = false;
@@ -224,6 +243,7 @@ function InterviewWorkspace() {
       setActiveSessionID(active);
       rememberSessionID(active);
       await loadSessionMessages(active);
+      await refreshPracticeState(active);
     })();
 
     return () => {
@@ -241,6 +261,7 @@ function InterviewWorkspace() {
     rememberSessionID(sessionID);
     setPendingConfirmation(null);
     await loadSessionMessages(sessionID);
+    await refreshPracticeState(sessionID);
   };
 
   const handleCreateSession = async () => {
@@ -250,6 +271,7 @@ function InterviewWorkspace() {
       setActiveSessionID(sessionID);
       rememberSessionID(sessionID);
       setPendingConfirmation(null);
+      setPracticeState(null);
       setMessages([WELCOME_MESSAGE]);
       setSessionDrawerOpen(false);
       await refreshSessions();
@@ -277,9 +299,11 @@ function InterviewWorkspace() {
       const next = remaining[0]?.session_id ?? null;
       setActiveSessionID(next);
       setPendingConfirmation(null);
+      setPracticeState(null);
       if (next) {
         rememberSessionID(next);
         void loadSessionMessages(next);
+        void refreshPracticeState(next);
       } else {
         setMessages([WELCOME_MESSAGE]);
       }
@@ -357,7 +381,8 @@ function InterviewWorkspace() {
     sessionID: string,
     text: string,
     clientMessageID: string,
-    targetId: string
+    targetId: string,
+    voiceCaptureID?: string
   ) => {
     const controller = new AbortController();
     abortRef.current = controller;
@@ -385,7 +410,10 @@ function InterviewWorkspace() {
             )
           );
         },
-        controller.signal
+        controller.signal,
+        // 练习状态跟随 done 帧回来，保证状态条与刚上屏的回复是同一轮的。
+        (state) => setPracticeState(state),
+        voiceCaptureID
       );
       // 回复完成后刷新会话列表，更新消息数与最近活跃时间。
       void refreshSessions();
@@ -409,7 +437,7 @@ function InterviewWorkspace() {
                   ...m,
                   content: "抱歉，暂时没能连上知镜，请稍后再试。",
                   failed: true,
-                  retry: { clientMessageID, text },
+                  retry: { clientMessageID, text, voiceCaptureID },
                 }
               : m
           )
@@ -421,7 +449,7 @@ function InterviewWorkspace() {
     }
   };
 
-  const handleSendMessage = async (text: string) => {
+  const handleSendMessage = async (text: string, voiceCaptureID?: string) => {
     const userMessage: Message = {
       id: Date.now().toString(),
       type: "user",
@@ -457,7 +485,7 @@ function InterviewWorkspace() {
       rememberSessionID(sessionID);
     }
     // 全新发送生成新的 client_message_id。
-    await streamAssistantReply(sessionID, text, crypto.randomUUID(), typingId);
+    await streamAssistantReply(sessionID, text, crypto.randomUUID(), typingId, voiceCaptureID);
   };
 
   // handleRetryMessage 重试失败的助手回复：复用原 client_message_id，让后端幂等去重
@@ -466,7 +494,7 @@ function InterviewWorkspace() {
     if (isSending) return;
     const target = messages.find((m) => m.id === messageId);
     if (!target?.retry) return;
-    const { clientMessageID, text } = target.retry;
+    const { clientMessageID, text, voiceCaptureID } = target.retry;
     const sessionID = activeSessionID ?? (await ensureSessionID());
     setMessages((prev) =>
       prev.map((m) =>
@@ -475,7 +503,7 @@ function InterviewWorkspace() {
           : m
       )
     );
-    await streamAssistantReply(sessionID, text, clientMessageID, messageId);
+    await streamAssistantReply(sessionID, text, clientMessageID, messageId, voiceCaptureID);
   };
 
   const handleAcceptMeal = () => {
@@ -549,6 +577,28 @@ function InterviewWorkspace() {
     abortRef.current?.abort();
   };
 
+  const handleSelectPracticePrompt = (prompt: { emoji: string; label: string }) => {
+    // “费曼学习”只是一个显式入口：它发的是一句开始练习的对话意图，
+    // 不切页面、不开表单。后续的提问→回答→分析→下一题全部在同一个聊天框里发生。
+    if (prompt.label === "费曼学习") {
+      void handleSendMessage("我想开始费曼学习练习");
+      return;
+    }
+    void handleSendMessage(`${prompt.emoji} ${prompt.label}`);
+  };
+
+  // handleVoiceCapture 把一段录音变成文字。
+  // 转写完就结束了：后续发送、分析走的仍是和打字完全一样的那条链路，
+  // 语音只是输入法，不是第二套业务流程。
+  const handleVoiceCapture = async (audio: Blob, durationMs: number) => {
+    const sessionID = activeSessionID ?? (await ensureSessionID());
+    if (!activeSessionID) {
+      setActiveSessionID(sessionID);
+      rememberSessionID(sessionID);
+    }
+    return uploadVoiceCapture(sessionID, audio, durationMs);
+  };
+
   // handlePhoto 拍照/选图入口。图片识别后端管线尚未接入，先给出本地占位回复。
   const handlePhoto = (file: File) => {
     const base = Date.now().toString();
@@ -581,6 +631,8 @@ function InterviewWorkspace() {
           />
 
           <StatusTags tags={tags} />
+
+          <PracticeStatusBar state={practiceState} />
 
           <div ref={scrollRef} className="flex-1 overflow-y-auto">
             {!conversationStarted ? (
@@ -696,8 +748,14 @@ function InterviewWorkspace() {
           </div>
 
           <InputDock
-            onSendMessage={handleSendMessage}
-            onVoiceInput={() => {}}
+            onSendMessage={(text, voiceCaptureID) => {
+              void handleSendMessage(text, voiceCaptureID);
+            }}
+            onVoiceCapture={handleVoiceCapture}
+            onSelectPrompt={handleSelectPracticePrompt}
+            activePrompt={
+              practiceState && practiceState.state !== "idle" ? "费曼学习" : undefined
+            }
             onPhoto={handlePhoto}
             isResponding={isSending}
             onStop={handleStop}

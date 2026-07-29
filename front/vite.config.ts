@@ -35,7 +35,13 @@ export default defineConfig({
   },
 
   server: {
-    // 绑 0.0.0.0：同时覆盖 127.0.0.1 和局域网 IP，手机可通过 http://<本机IP>:5173 访问
+    // 绑 0.0.0.0：同时覆盖 127.0.0.1 和局域网 IP，手机可通过 http://<本机IP>:5173 访问。
+    //
+    // ⚠️ 但录音功能只在**安全来源**下可用：浏览器仅对 https、localhost、127.0.0.1
+    // 挂载 navigator.mediaDevices，用 http://<局域网IP>:5173 打开时它是 undefined，
+    // 点录音会直接报「浏览器只在安全来源下开放麦克风」。
+    // 本机调试请一律走 http://localhost:5173；确实要用手机练语音时，
+    // 给 dev server 配自签证书（@vitejs/plugin-basic-ssl）改走 https。
     host: '0.0.0.0',
     port: 5173,
     strictPort: true,

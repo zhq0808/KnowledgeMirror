@@ -1,6 +1,8 @@
 // chat.ts 封装与后端对话接口的通信。
 // 后端统一响应格式：{ code, message, data, trace_id }，code === 0 表示成功。
 
+import type { FeynmanPracticeState } from "./feynman";
+
 interface APIResponse {
   code: number;
   message: string;
@@ -175,6 +177,7 @@ interface SSEFrame {
   delta?: string;
   message?: string;
   sources?: RetrievalSources;
+  practice?: FeynmanPracticeState;
 }
 
 // parseFrame 解析单个 SSE 帧（形如 "event: xxx\ndata: {json}"）。
@@ -192,6 +195,9 @@ function parseFrame(frame: string): SSEFrame {
       delta: obj.delta,
       message: obj.message,
       sources: event === "sources" ? (obj as RetrievalSources) : undefined,
+      // 费曼练习状态挂在 done 帧上：这一轮对话可能刚刚改变了练习状态，
+      // 只有跟着收尾帧一起回来，状态条才不会滞后于刚上屏的回复。
+      practice: event === "done" ? (obj.feynman as FeynmanPracticeState | undefined) : undefined,
     };
   } catch {
     return { event };
@@ -207,7 +213,11 @@ export async function sendChatStream(
   message: string,
   onDelta: (delta: string) => void,
   onSources: (sources: RetrievalSources) => void,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onPracticeState?: (state: FeynmanPracticeState) => void,
+  // voiceCaptureID 可选：这条消息由哪段录音转写而来。
+  // 只用于把原始转写和用户实际发出的文本关联起来，不影响任何对话逻辑。
+  voiceCaptureID?: string
 ): Promise<void> {
   const res = await fetch("/api/v1/chat/stream", {
     method: "POST",
@@ -217,6 +227,7 @@ export async function sendChatStream(
       session_id: sessionID,
       client_message_id: clientMessageID,
       message,
+      ...(voiceCaptureID ? { voice_capture_id: voiceCaptureID } : {}),
     }),
     signal,
   });
@@ -241,9 +252,12 @@ export async function sendChatStream(
       const frame = buffer.slice(0, idx);
       buffer = buffer.slice(idx + 2);
 
-      const { event, delta, message: errMsg, sources } = parseFrame(frame);
+      const { event, delta, message: errMsg, sources, practice } = parseFrame(frame);
       if (event === "error") throw new Error(errMsg || "对话失败");
-      if (event === "done") return;
+      if (event === "done") {
+        if (practice) onPracticeState?.(practice);
+        return;
+      }
       if (event === "sources" && sources) {
         onSources(sources);
         continue;
