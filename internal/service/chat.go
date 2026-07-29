@@ -52,6 +52,15 @@ type ChatRetriever interface {
 	Retrieve(ctx context.Context, query RetrievalQuery) (RetrievalResult, error)
 }
 
+// ChatPracticeRouter 让“对话内练习”有机会先接管一条消息。
+//
+// 费曼学习不是独立页面，而是同一个聊天框里的一种会话状态，所以它必须挂在 Stream 的
+// 最前面：返回 handled=true 时本轮不再调用聊天模型，回复由练习链路自己产生。
+// 返回 handled=false 时一切照旧走自由对话——练习链路的任何故障都只能降级，不能阻断聊天。
+type ChatPracticeRouter interface {
+	Handle(ctx context.Context, request ChatStreamRequest) (handled bool, content string, err error)
+}
+
 // ChatStreamRequest 是一次流式对话所需的全部输入与回调。
 // 用结构体而不是一长串参数，是因为检索还需要 SessionID/TraceID 做审计，
 // 且引用列表要在首个内容增量之前先回传给接口层。
@@ -60,6 +69,11 @@ type ChatStreamRequest struct {
 	SessionID string
 	TraceID   string
 	History   []ConversationMessage
+	// Message 是本轮用户原文，UserMessageID 是它落库后的 message_id。
+	// 练习链路需要这两个字段：前者用于意图识别，后者用于同一条消息重试时回放上次结果，
+	// 避免重复调用模型并把状态多推进一轮。
+	Message       string
+	UserMessageID string
 	// OnRetrieval 在模型调用前被调一次，供接口层先下发引用来源；可为 nil。
 	OnRetrieval func(result RetrievalResult) error
 	OnDelta     func(delta string) error
@@ -71,6 +85,7 @@ type ChatService struct {
 	prompt        *ChatPrompt
 	memories      ChatMemoryReader
 	retrieval     ChatRetriever
+	practice      ChatPracticeRouter
 	memoryBudget  MemoryBudget
 	maxReplyChars int
 }
@@ -97,6 +112,13 @@ func (s *ChatService) WithRetrieval(retrieval ChatRetriever) *ChatService {
 	return s
 }
 
+// WithPractice 在组装根注入对话内练习路由（当前是费曼学习）。
+// 同样按可选能力挂载：未注入时聊天链路完全不受影响。
+func (s *ChatService) WithPractice(practice ChatPracticeRouter) *ChatService {
+	s.practice = practice
+	return s
+}
+
 func (s *ChatService) Timeout() time.Duration {
 	return s.model.Timeout()
 }
@@ -116,6 +138,17 @@ func (s *ChatService) ModelName() string {
 // 达到 maxReplyChars 上限时，附加一段截断提示后正常收尾（返回 nil error），
 // 因为客户端已经看到了前面这部分内容，不应该被当作一次调用失败。
 func (s *ChatService) Stream(ctx context.Context, request ChatStreamRequest) (string, error) {
+	// 练习链路优先：它可能把这条消息判定为一次费曼回答，从而完全替代本轮模型调用。
+	if s.practice != nil {
+		handled, content, practiceErr := s.practice.Handle(ctx, request)
+		if practiceErr != nil {
+			return content, practiceErr
+		}
+		if handled {
+			return content, nil
+		}
+	}
+
 	userFactSummary, err := s.loadUserFactSummary(ctx, request.UserID)
 	if err != nil {
 		return "", fmt.Errorf("加载用户记忆失败: %w", err)
