@@ -111,6 +111,20 @@ type CompleteVoiceCaptureParams struct {
 	TranscriptError    string
 }
 
+// FinalizeRealtimeInput 是实时 STT 已结束后一次性固化所需的数据。
+// TranscriptError 非空表示上游失败、用户取消或浏览器断连等失败终态。
+type FinalizeRealtimeInput struct {
+	UserID          string
+	SessionID       string
+	WAV             []byte
+	Transcript      string
+	Provider        string
+	Model           string
+	TaskID          string
+	DurationMs      *int
+	TranscriptError string
+}
+
 // VoiceCaptureRepository 是语音录音的持久化边界。
 type VoiceCaptureRepository interface {
 	// Claim 抢占一次转写。相同用户+会话+字节的重复提交命中去重记录并返回 claimed=false，
@@ -174,45 +188,11 @@ func (s *VoiceCaptureService) STTProviderName() string { return s.stt.Name() }
 // 失败也是一次真实发生过的录音，前端据此提示「转写失败，请改用打字」，
 // 不该让用户以为自己刚才那段话凭空消失了。只有输入不合法或存储故障才返回错误。
 func (s *VoiceCaptureService) Capture(ctx context.Context, userID, sessionID string, audio []byte, mimeType string, durationMs *int) (VoiceCapture, error) {
-	userID = strings.TrimSpace(userID)
-	sessionID = strings.TrimSpace(sessionID)
-	if userID == "" {
-		return VoiceCapture{}, invalidVoiceInput("用户身份缺失")
-	}
-	if sessionID == "" {
-		return VoiceCapture{}, invalidVoiceInput("缺少会话 ID")
-	}
-	if len(audio) == 0 {
-		return VoiceCapture{}, invalidVoiceInput("音频内容为空")
-	}
-	if int64(len(audio)) > s.limits.MaxAudioBytes {
-		return VoiceCapture{}, invalidVoiceInput("音频大小超过上限（%d 字节）", s.limits.MaxAudioBytes)
-	}
-	if !isAllowedFeynmanAudioMIME(mimeType) {
-		return VoiceCapture{}, invalidVoiceInput("不支持的音频格式: %s", mimeType)
-	}
-	if durationMs != nil && (*durationMs <= 0 || *durationMs > s.limits.MaxDurationMS) {
-		return VoiceCapture{}, invalidVoiceInput("录音时长超过上限（%d 毫秒）", s.limits.MaxDurationMS)
-	}
-
-	hash := sha256.Sum256(audio)
-	captureID, err := NewVoiceCaptureID()
+	userID, sessionID, err := s.validateInput(userID, sessionID, audio, mimeType, durationMs)
 	if err != nil {
 		return VoiceCapture{}, err
 	}
-
-	claimed, won, err := s.repo.Claim(ctx, ClaimVoiceCaptureParams{
-		CaptureID:   captureID,
-		UserID:      userID,
-		SessionID:   sessionID,
-		MIMEType:    mimeType,
-		SizeBytes:   int64(len(audio)),
-		DurationMs:  durationMs,
-		SHA256:      hash[:],
-		AudioData:   audio,
-		STTProvider: s.stt.Name(),
-		StaleBefore: time.Now().Add(-s.limits.TranscribingStale),
-	})
+	claimed, won, err := s.claim(ctx, userID, sessionID, audio, mimeType, durationMs, s.stt.Name())
 	if err != nil {
 		return VoiceCapture{}, err
 	}
@@ -255,7 +235,107 @@ func (s *VoiceCaptureService) Capture(ctx context.Context, userID, sessionID str
 		}
 	}
 	params.NeedsConfirmation, params.ConfirmationReason = s.judgeConfirmation(params)
+	return s.complete(ctx, params)
+}
 
+// FinalizeRealtime 将实时供应商已经生成的最终文本和完整 WAV 一次性固化。
+// 它刻意不调用 stt.Provider.Transcribe，避免同一段音频产生第二份文本和重复费用。
+func (s *VoiceCaptureService) FinalizeRealtime(ctx context.Context, input FinalizeRealtimeInput) (VoiceCapture, error) {
+	const mimeType = "audio/wav"
+	userID, sessionID, err := s.validateInput(input.UserID, input.SessionID, input.WAV, mimeType, input.DurationMs)
+	if err != nil {
+		return VoiceCapture{}, err
+	}
+	provider := strings.TrimSpace(input.Provider)
+	if provider == "" {
+		return VoiceCapture{}, invalidVoiceInput("缺少实时转写供应商")
+	}
+
+	finalizeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	claimed, won, err := s.claim(finalizeCtx, userID, sessionID, input.WAV, mimeType, input.DurationMs, provider)
+	if err != nil {
+		return VoiceCapture{}, err
+	}
+	if !won {
+		s.log.Info("命中已有实时语音记录，跳过重复固化",
+			"session_id", sessionID, "capture_id", claimed.CaptureID)
+		return claimed, nil
+	}
+
+	params := CompleteVoiceCaptureParams{
+		CaptureID:    claimed.CaptureID,
+		UserID:       userID,
+		STTProvider:  provider,
+		STTModel:     strings.TrimSpace(input.Model),
+		STTRequestID: strings.TrimSpace(input.TaskID),
+	}
+	text := strings.TrimSpace(input.Transcript)
+	transcriptError := strings.TrimSpace(input.TranscriptError)
+	switch {
+	case transcriptError != "":
+		params.Status = VoiceCaptureStatusFailed
+		params.TranscriptError = truncateFeynmanError(transcriptError, 2000)
+	case text == "":
+		params.Status = VoiceCaptureStatusFailed
+		params.TranscriptError = "STT 返回空转写文本"
+	case utf8.RuneCountInString(text) > s.limits.MaxTranscriptChars:
+		params.Status = VoiceCaptureStatusFailed
+		params.TranscriptError = fmt.Sprintf("STT 转写超过 %d 字上限", s.limits.MaxTranscriptChars)
+	default:
+		params.Status = VoiceCaptureStatusTranscribed
+		params.RawTranscript = text
+		params.AmbiguousTerms = s.glossary.AmbiguousTerms(text, s.limits.MaxAmbiguousTerms)
+	}
+	params.NeedsConfirmation, params.ConfirmationReason = s.judgeConfirmation(params)
+	return s.repo.Complete(finalizeCtx, params)
+}
+
+func (s *VoiceCaptureService) validateInput(userID, sessionID string, audio []byte, mimeType string, durationMs *int) (string, string, error) {
+	userID = strings.TrimSpace(userID)
+	sessionID = strings.TrimSpace(sessionID)
+	if userID == "" {
+		return "", "", invalidVoiceInput("用户身份缺失")
+	}
+	if sessionID == "" {
+		return "", "", invalidVoiceInput("缺少会话 ID")
+	}
+	if len(audio) == 0 {
+		return "", "", invalidVoiceInput("音频内容为空")
+	}
+	if int64(len(audio)) > s.limits.MaxAudioBytes {
+		return "", "", invalidVoiceInput("音频大小超过上限（%d 字节）", s.limits.MaxAudioBytes)
+	}
+	if !isAllowedFeynmanAudioMIME(mimeType) {
+		return "", "", invalidVoiceInput("不支持的音频格式: %s", mimeType)
+	}
+	if durationMs != nil && (*durationMs <= 0 || *durationMs > s.limits.MaxDurationMS) {
+		return "", "", invalidVoiceInput("录音时长超过上限（%d 毫秒）", s.limits.MaxDurationMS)
+	}
+	return userID, sessionID, nil
+}
+
+func (s *VoiceCaptureService) claim(ctx context.Context, userID, sessionID string, audio []byte, mimeType string, durationMs *int, provider string) (VoiceCapture, bool, error) {
+	hash := sha256.Sum256(audio)
+	captureID, err := NewVoiceCaptureID()
+	if err != nil {
+		return VoiceCapture{}, false, err
+	}
+	return s.repo.Claim(ctx, ClaimVoiceCaptureParams{
+		CaptureID:   captureID,
+		UserID:      userID,
+		SessionID:   sessionID,
+		MIMEType:    mimeType,
+		SizeBytes:   int64(len(audio)),
+		DurationMs:  durationMs,
+		SHA256:      hash[:],
+		AudioData:   audio,
+		STTProvider: provider,
+		StaleBefore: time.Now().Add(-s.limits.TranscribingStale),
+	})
+}
+
+func (s *VoiceCaptureService) complete(ctx context.Context, params CompleteVoiceCaptureParams) (VoiceCapture, error) {
 	// 转写已经花掉了真金白银，落库不能因为用户关掉页面（ctx 被取消）就丢掉。
 	completeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 	defer cancel()

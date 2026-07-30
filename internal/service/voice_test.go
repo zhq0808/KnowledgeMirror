@@ -1,4 +1,4 @@
-﻿package service
+package service
 
 import (
 	"context"
@@ -28,7 +28,10 @@ func newFakeVoiceRepository() *fakeVoiceRepository {
 	return &fakeVoiceRepository{rows: map[string]*VoiceCapture{}, bySHA: map[string]string{}}
 }
 
-func (r *fakeVoiceRepository) Claim(_ context.Context, params ClaimVoiceCaptureParams) (VoiceCapture, bool, error) {
+func (r *fakeVoiceRepository) Claim(ctx context.Context, params ClaimVoiceCaptureParams) (VoiceCapture, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return VoiceCapture{}, false, err
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	key := params.SessionID + "|" + hex.EncodeToString(params.SHA256)
@@ -59,7 +62,10 @@ func (r *fakeVoiceRepository) Claim(_ context.Context, params ClaimVoiceCaptureP
 	return *row, true, nil
 }
 
-func (r *fakeVoiceRepository) Complete(_ context.Context, params CompleteVoiceCaptureParams) (VoiceCapture, error) {
+func (r *fakeVoiceRepository) Complete(ctx context.Context, params CompleteVoiceCaptureParams) (VoiceCapture, error) {
+	if err := ctx.Err(); err != nil {
+		return VoiceCapture{}, err
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	row, found := r.rows[params.CaptureID]
@@ -78,6 +84,7 @@ func (r *fakeVoiceRepository) Complete(_ context.Context, params CompleteVoiceCa
 	row.ConfirmationReason = params.ConfirmationReason
 	row.STTProvider = params.STTProvider
 	row.STTModel = params.STTModel
+	row.STTRequestID = params.STTRequestID
 	row.UpdatedAt = time.Now()
 	return *row, nil
 }
@@ -100,7 +107,10 @@ func (r *fakeVoiceRepository) BindMessage(_ context.Context, _, _, captureID, me
 		return r.bindErr
 	}
 	row, found := r.rows[captureID]
-	if !found {
+	if !found || row.Status != VoiceCaptureStatusTranscribed {
+		return ErrVoiceCaptureNotFound
+	}
+	if row.MessageID != "" && row.MessageID != messageID {
 		return ErrVoiceCaptureNotFound
 	}
 	row.MessageID = messageID
@@ -243,6 +253,125 @@ func TestVoiceCaptureDeduplicatesIdenticalAudio(t *testing.T) {
 	}
 	if provider.calls != 1 {
 		t.Fatalf("STT 调用次数 = %d, want 1", provider.calls)
+	}
+}
+
+func TestVoiceFinalizeRealtimePersistsProviderResultWithoutCallingFileSTT(t *testing.T) {
+	provider := &voiceSTTStub{text: "不应出现的文件式转写", confidence: floatPtr(0.99)}
+	voice, _ := newTestVoiceService(t, provider)
+	durationMs := 2300
+
+	capture, err := voice.FinalizeRealtime(context.Background(), FinalizeRealtimeInput{
+		UserID: "usr_1", SessionID: "session_1", WAV: []byte("complete-wav"),
+		Transcript: "这里用密等保证请求不会重复执行", Provider: "dashscope_paraformer",
+		Model: "paraformer-realtime-v2", TaskID: "task-1", DurationMs: &durationMs,
+	})
+	if err != nil {
+		t.Fatalf("FinalizeRealtime() error = %v", err)
+	}
+	if provider.calls != 0 {
+		t.Fatalf("文件式 STT 调用次数 = %d, want 0", provider.calls)
+	}
+	if capture.Status != VoiceCaptureStatusTranscribed || capture.RawTranscript != "这里用密等保证请求不会重复执行" {
+		t.Fatalf("capture = %+v, want 实时供应商文本的 transcribed 终态", capture)
+	}
+	if capture.STTProvider != "dashscope_paraformer" || capture.STTModel != "paraformer-realtime-v2" || capture.STTRequestID != "task-1" {
+		t.Fatalf("供应商元数据未完整固化: %+v", capture)
+	}
+	if !capture.NeedsConfirmation || capture.ConfirmationReason != VoiceConfirmReasonMissingConfidence {
+		t.Fatalf("实时转写无整体置信度时应要求 review: %+v", capture)
+	}
+	if len(capture.AmbiguousTerms) != 1 || capture.AmbiguousTerms[0].Term != "幂等" {
+		t.Fatalf("未复用术语检测: %+v", capture.AmbiguousTerms)
+	}
+}
+
+func TestVoiceFinalizeRealtimeFailureRecordsCannotBind(t *testing.T) {
+	cases := []struct {
+		name            string
+		transcript      string
+		transcriptError string
+		wantError       string
+	}{
+		{name: "空文本", transcript: "   ", wantError: "STT 返回空转写文本"},
+		{name: "上游失败", transcript: "未完成的过程文字", transcriptError: "upstream_failed", wantError: "upstream_failed"},
+		{name: "用户取消", transcriptError: "user_cancelled", wantError: "user_cancelled"},
+		{name: "浏览器断连", transcriptError: "browser_disconnected", wantError: "browser_disconnected"},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			provider := &voiceSTTStub{text: "不应调用"}
+			voice, repo := newTestVoiceService(t, provider)
+			capture, err := voice.FinalizeRealtime(context.Background(), FinalizeRealtimeInput{
+				UserID: "usr_1", SessionID: "session_1", WAV: []byte(testCase.name),
+				Transcript: testCase.transcript, TranscriptError: testCase.transcriptError,
+				Provider: "dashscope_paraformer", Model: "paraformer-realtime-v2", TaskID: "task-failed",
+			})
+			if err != nil {
+				t.Fatalf("FinalizeRealtime() error = %v", err)
+			}
+			if capture.Status != VoiceCaptureStatusFailed || capture.TranscriptError != testCase.wantError {
+				t.Fatalf("capture = %+v, want failed/%q", capture, testCase.wantError)
+			}
+			if capture.RawTranscript != "" {
+				t.Fatalf("失败过程文字不能固化为原始终态转写, got %q", capture.RawTranscript)
+			}
+			if err := voice.BindMessage(context.Background(), "usr_1", "session_1", capture.CaptureID, "msg_1"); !errors.Is(err, ErrVoiceCaptureNotFound) {
+				t.Fatalf("失败记录 BindMessage() error = %v, want ErrVoiceCaptureNotFound", err)
+			}
+			if repo.bindCalls != 1 {
+				t.Fatalf("bindCalls = %d, want 1", repo.bindCalls)
+			}
+			if provider.calls != 0 {
+				t.Fatalf("文件式 STT 调用次数 = %d, want 0", provider.calls)
+			}
+		})
+	}
+}
+
+func TestVoiceFinalizeRealtimePersistsFailureAfterBrowserContextCancellation(t *testing.T) {
+	voice, _ := newTestVoiceService(t, &voiceSTTStub{text: "不应调用"})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	capture, err := voice.FinalizeRealtime(ctx, FinalizeRealtimeInput{
+		UserID: "usr_1", SessionID: "session_1", WAV: []byte("disconnected-wav"),
+		Provider: "dashscope_paraformer", TranscriptError: "browser_disconnected",
+	})
+	if err != nil {
+		t.Fatalf("FinalizeRealtime() error = %v, want 断连后仍限时固化失败记录", err)
+	}
+	if capture.Status != VoiceCaptureStatusFailed || capture.TranscriptError != "browser_disconnected" {
+		t.Fatalf("capture = %+v, want browser_disconnected failed 终态", capture)
+	}
+}
+
+func TestVoiceFinalizeRealtimeDeduplicatesAndKeepsTerminalTranscript(t *testing.T) {
+	provider := &voiceSTTStub{text: "不应调用"}
+	voice, _ := newTestVoiceService(t, provider)
+	input := FinalizeRealtimeInput{
+		UserID: "usr_1", SessionID: "session_1", WAV: []byte("same-realtime-wav"),
+		Transcript: "第一次供应商最终文本", Provider: "dashscope_paraformer", TaskID: "task-1",
+	}
+	first, err := voice.FinalizeRealtime(context.Background(), input)
+	if err != nil {
+		t.Fatalf("首次 FinalizeRealtime() error = %v", err)
+	}
+	input.Transcript = "重复请求试图覆盖终态"
+	input.TaskID = "task-2"
+	second, err := voice.FinalizeRealtime(context.Background(), input)
+	if err != nil {
+		t.Fatalf("重复 FinalizeRealtime() error = %v", err)
+	}
+	if first.CaptureID != second.CaptureID {
+		t.Fatalf("重复 WAV 应命中同一记录: %q vs %q", first.CaptureID, second.CaptureID)
+	}
+	if second.RawTranscript != first.RawTranscript || second.STTRequestID != "task-1" {
+		t.Fatalf("终态被重复固化覆盖: first=%+v second=%+v", first, second)
+	}
+	if provider.calls != 0 {
+		t.Fatalf("文件式 STT 调用次数 = %d, want 0", provider.calls)
 	}
 }
 

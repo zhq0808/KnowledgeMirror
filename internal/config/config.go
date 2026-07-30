@@ -47,14 +47,38 @@ type SpeechConfig struct {
 // 注意这里没有 STT 供应商配置：语音输入与语音费曼练习共用 feynman.stt.*，
 // 同一个供应商实例注入两个服务。拆成两套只会制造“换了一处忘了另一处”的配置陷阱。
 type VoiceConfig struct {
-	Enabled                 bool    `yaml:"enabled"                   env:"ENABLED"                   env-default:"true"`
-	MaxAudioBytes           int64   `yaml:"max_audio_bytes"           env:"MAX_AUDIO_BYTES"           env-default:"6291456"`
-	MaxDurationMS           int     `yaml:"max_duration_ms"           env:"MAX_DURATION_MS"           env-default:"180000"`
-	MaxTranscriptChars      int     `yaml:"max_transcript_chars"      env:"MAX_TRANSCRIPT_CHARS"      env-default:"8000"`
-	MinConfidence           float64 `yaml:"min_confidence"            env:"MIN_CONFIDENCE"            env-default:"0.6"`
-	MaxAmbiguousTerms       int     `yaml:"max_ambiguous_terms"       env:"MAX_AMBIGUOUS_TERMS"       env-default:"5"`
-	GlossaryPath            string  `yaml:"glossary_path"             env:"GLOSSARY_PATH"             env-default:"prompts/voice_glossary_v1.txt"`
-	TranscribingStaleSecond int     `yaml:"transcribing_stale_seconds" env:"TRANSCRIBING_STALE_SECONDS" env-default:"120"`
+	Enabled                 bool                `yaml:"enabled"                   env:"ENABLED"                   env-default:"true"`
+	MaxAudioBytes           int64               `yaml:"max_audio_bytes"           env:"MAX_AUDIO_BYTES"           env-default:"6291456"`
+	MaxDurationMS           int                 `yaml:"max_duration_ms"           env:"MAX_DURATION_MS"           env-default:"180000"`
+	MaxTranscriptChars      int                 `yaml:"max_transcript_chars"      env:"MAX_TRANSCRIPT_CHARS"      env-default:"8000"`
+	MinConfidence           float64             `yaml:"min_confidence"            env:"MIN_CONFIDENCE"            env-default:"0.6"`
+	MaxAmbiguousTerms       int                 `yaml:"max_ambiguous_terms"       env:"MAX_AMBIGUOUS_TERMS"       env-default:"5"`
+	GlossaryPath            string              `yaml:"glossary_path"             env:"GLOSSARY_PATH"             env-default:"prompts/voice_glossary_v1.txt"`
+	TranscribingStaleSecond int                 `yaml:"transcribing_stale_seconds" env:"TRANSCRIBING_STALE_SECONDS" env-default:"120"`
+	Realtime                VoiceRealtimeConfig `yaml:"realtime" env-prefix:"REALTIME_"`
+}
+
+// VoiceRealtimeConfig 控制 Go 到实时 ASR 供应商的协议客户端及后续流式编排预算。
+// APIKey 只从 VOICE_REALTIME_API_KEY 读取，禁止写入 YAML。
+type VoiceRealtimeConfig struct {
+	Enabled              bool   `yaml:"enabled"                  env:"ENABLED"                  env-default:"false"`
+	Provider             string `yaml:"provider"                 env:"PROVIDER"                 env-default:"dashscope_paraformer"`
+	APIKey               string `yaml:"-"                        env:"API_KEY"`
+	WebSocketURL         string `yaml:"websocket_url"            env:"WEBSOCKET_URL"            env-default:"wss://{workspace_id}.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference"`
+	WorkspaceID          string `yaml:"workspace_id"             env:"WORKSPACE_ID"`
+	Model                string `yaml:"model"                    env:"MODEL"                    env-default:"paraformer-realtime-v2"`
+	SampleRate           int    `yaml:"sample_rate"              env:"SAMPLE_RATE"              env-default:"16000"`
+	FrameMS              int    `yaml:"frame_ms"                 env:"FRAME_MS"                 env-default:"100"`
+	MaxDurationMS        int    `yaml:"max_duration_ms"          env:"MAX_DURATION_MS"          env-default:"180000"`
+	MaxAudioBytes        int64  `yaml:"max_audio_bytes"          env:"MAX_AUDIO_BYTES"          env-default:"6291456"`
+	MaxConcurrentStreams int    `yaml:"max_concurrent_streams"   env:"MAX_CONCURRENT_STREAMS"   env-default:"20"`
+	MaxStreamsPerUser    int    `yaml:"max_streams_per_user"     env:"MAX_STREAMS_PER_USER"     env-default:"1"`
+	AudioQueueFrames     int    `yaml:"audio_queue_frames"       env:"AUDIO_QUEUE_FRAMES"       env-default:"10"`
+	EventQueueSize       int    `yaml:"event_queue_size"         env:"EVENT_QUEUE_SIZE"         env-default:"32"`
+	StartTimeoutSeconds  int    `yaml:"start_timeout_seconds"    env:"START_TIMEOUT_SECONDS"    env-default:"8"`
+	FinishTimeoutSeconds int    `yaml:"finish_timeout_seconds"   env:"FINISH_TIMEOUT_SECONDS"   env-default:"8"`
+	WriteTimeoutSeconds  int    `yaml:"write_timeout_seconds"    env:"WRITE_TIMEOUT_SECONDS"    env-default:"5"`
+	IdleTimeoutSeconds   int    `yaml:"idle_timeout_seconds"     env:"IDLE_TIMEOUT_SECONDS"     env-default:"30"`
 }
 
 // FeynmanSTTConfig 控制语音费曼练习的 STT 供应商接入。

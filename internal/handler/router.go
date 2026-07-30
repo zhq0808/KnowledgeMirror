@@ -29,6 +29,7 @@ type Server struct {
 	feynman        *service.FeynmanService
 	practice       *service.FeynmanDialogService
 	voice          *service.VoiceCaptureService
+	realtimeVoice  *service.RealtimeVoiceService
 	speech         *service.SpeechService
 	memory         memoryNotifier
 	identityConfig config.IdentityConfig
@@ -40,8 +41,9 @@ type Server struct {
 // feynman 可为 nil（未配置 STT/知识点时语音费曼练习接口不注册）；
 // practice 可为 nil（未启用对话式费曼学习时不下发练习状态）；
 // voice 可为 nil（未配置 STT 或关闭语音输入时录音接口不注册）；
+// realtimeVoice 可为 nil（实时配置不完整时 WebSocket 路由不注册）；
 // speech 可为 nil（未配置 TTS 或关闭语音合成时朗读接口不注册）。
-func NewServer(chat *service.ChatService, identity *service.IdentityService, sessions *service.SessionService, messages *service.MessageService, turnLeases *service.TurnLeaseService, documents *service.DocumentService, candidates *service.CandidateService, retrieval *service.RetrievalService, feynman *service.FeynmanService, practice *service.FeynmanDialogService, voice *service.VoiceCaptureService, speech *service.SpeechService, memory memoryNotifier, identityConfig config.IdentityConfig, log *slog.Logger) *Server {
+func NewServer(chat *service.ChatService, identity *service.IdentityService, sessions *service.SessionService, messages *service.MessageService, turnLeases *service.TurnLeaseService, documents *service.DocumentService, candidates *service.CandidateService, retrieval *service.RetrievalService, feynman *service.FeynmanService, practice *service.FeynmanDialogService, voice *service.VoiceCaptureService, realtimeVoice *service.RealtimeVoiceService, speech *service.SpeechService, memory memoryNotifier, identityConfig config.IdentityConfig, log *slog.Logger) *Server {
 	gin.SetMode(gin.ReleaseMode)
 	s := &Server{
 		chat:           chat,
@@ -55,6 +57,7 @@ func NewServer(chat *service.ChatService, identity *service.IdentityService, ses
 		feynman:        feynman,
 		practice:       practice,
 		voice:          voice,
+		realtimeVoice:  realtimeVoice,
 		speech:         speech,
 		memory:         memory,
 		identityConfig: identityConfig,
@@ -136,6 +139,9 @@ func (s *Server) routes() {
 				bodyLimitMiddleware(feynmanAudioBodyLimitBytes(s.voice.Limits().MaxAudioBytes)),
 				s.createVoiceCaptureHandler)
 			voice.GET("/captures/:capture_id", s.getVoiceCaptureHandler)
+		}
+		if s.realtimeVoice != nil {
+			protected.GET("/voice/realtime", s.realtimeVoiceHandler)
 		}
 
 		// 语音合成：把已经展示给用户的费曼提问念出来。

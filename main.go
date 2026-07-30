@@ -374,6 +374,47 @@ func run() error {
 		log.Info("通用语音输入未启用（VOICE_ENABLED=false）")
 	}
 
+	// 实时语音使用独立的 DashScope Paraformer Provider。配置不完整时只不注册 WebSocket，
+	// 上面的 MiMo 文件式 STT、文字聊天和下面的 MiMo TTS 均保持可用。
+	var realtimeVoiceService *service.RealtimeVoiceService
+	if cfg.Voice.Realtime.Enabled && voiceService != nil &&
+		cfg.Voice.Realtime.APIKey != "" && cfg.Voice.Realtime.WorkspaceID != "" {
+		realtimeProvider := stt.NewDashScopeParaformerProvider(stt.DashScopeParaformerOptions{
+			APIKey:          cfg.Voice.Realtime.APIKey,
+			WorkspaceID:     cfg.Voice.Realtime.WorkspaceID,
+			WebSocketURL:    cfg.Voice.Realtime.WebSocketURL,
+			Model:           cfg.Voice.Realtime.Model,
+			SampleRate:      cfg.Voice.Realtime.SampleRate,
+			StartTimeout:    time.Duration(cfg.Voice.Realtime.StartTimeoutSeconds) * time.Second,
+			FinishTimeout:   time.Duration(cfg.Voice.Realtime.FinishTimeoutSeconds) * time.Second,
+			EventBufferSize: cfg.Voice.Realtime.EventQueueSize,
+		})
+		maxFrameBytes := int64(cfg.Voice.Realtime.SampleRate * 2 * cfg.Voice.Realtime.FrameMS / 1000)
+		realtimeVoiceService = service.NewRealtimeVoiceService(
+			realtimeProvider,
+			voiceService,
+			service.RealtimeVoiceLimits{
+				SampleRate:           cfg.Voice.Realtime.SampleRate,
+				MaxFrameBytes:        maxFrameBytes,
+				MaxDuration:          time.Duration(cfg.Voice.Realtime.MaxDurationMS) * time.Millisecond,
+				MaxAudioBytes:        cfg.Voice.Realtime.MaxAudioBytes,
+				MaxConcurrentStreams: cfg.Voice.Realtime.MaxConcurrentStreams,
+				MaxStreamsPerUser:    cfg.Voice.Realtime.MaxStreamsPerUser,
+				AudioQueueFrames:     cfg.Voice.Realtime.AudioQueueFrames,
+				EventQueueSize:       cfg.Voice.Realtime.EventQueueSize,
+				StartTimeout:         time.Duration(cfg.Voice.Realtime.StartTimeoutSeconds) * time.Second,
+				FinishTimeout:        time.Duration(cfg.Voice.Realtime.FinishTimeoutSeconds) * time.Second,
+				WriteTimeout:         time.Duration(cfg.Voice.Realtime.WriteTimeoutSeconds) * time.Second,
+				IdleTimeout:          time.Duration(cfg.Voice.Realtime.IdleTimeoutSeconds) * time.Second,
+			},
+		)
+		log.Info("实时语音输入已启用", "stt_provider", realtimeProvider.Name(), "model", realtimeProvider.Model())
+	} else if cfg.Voice.Realtime.Enabled {
+		log.Info("实时语音输入未启用（配置不完整或通用语音输入已关闭）")
+	} else {
+		log.Info("实时语音输入未启用（VOICE_REALTIME_ENABLED=false）")
+	}
+
 	// 语音合成：把费曼提问和追问念出来。未配置密钥时直接不注册接口，
 	// 而不是像 STT 那样造一个占位实现：念一段占位音频没任何价值，没有声音就看文字即可。
 	var speechService *service.SpeechService
@@ -402,7 +443,7 @@ func run() error {
 		log.Info("语音合成未启用（SPEECH_ENABLED=false）")
 	}
 
-	srvHandler := handler.NewServer(chatService, identityService, sessionService, messageService, turnLeaseService, documentService, candidateService, retrievalService, feynmanService, feynmanDialogService, voiceService, speechService, memoryPipeline, cfg.Identity, log).Handler()
+	srvHandler := handler.NewServer(chatService, identityService, sessionService, messageService, turnLeaseService, documentService, candidateService, retrievalService, feynmanService, feynmanDialogService, voiceService, realtimeVoiceService, speechService, memoryPipeline, cfg.Identity, log).Handler()
 	srv := &http.Server{
 		Addr:              ":" + cfg.HTTP.Port,
 		Handler:           srvHandler,

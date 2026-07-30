@@ -52,11 +52,6 @@ logs/
 
 # ---- 内部文档（不入库）----
 docs/
-!docs/
-docs/*
-!docs/0726/
-docs/0726/*
-!docs/0726/Agent知识库检索v0代码审查.md
 
 # ---- 前端 / Node（front/）----
 node_modules/

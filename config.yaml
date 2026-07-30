@@ -110,6 +110,26 @@ voice:
   max_ambiguous_terms: 5          # 单次最多提示几个疑似听错的术语
   glossary_path: "prompts/voice_glossary_v1.txt"
   transcribing_stale_seconds: 120 # 超过此时长仍卡在 transcribing 的记录允许被重试接管
+  # 实时 ASR 使用独立 DashScope WebSocket 协议；任务 1 只实现供应商客户端，尚不注册浏览器路由。
+  realtime:
+    enabled: false
+    provider: "dashscope_paraformer"
+    websocket_url: "wss://{workspace_id}.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference"
+    workspace_id: ""
+    model: "paraformer-realtime-v2"
+    sample_rate: 16000
+    frame_ms: 100
+    max_duration_ms: 180000
+    max_audio_bytes: 6291456
+    max_concurrent_streams: 20
+    max_streams_per_user: 1
+    audio_queue_frames: 10
+    event_queue_size: 32
+    start_timeout_seconds: 8
+    finish_timeout_seconds: 8
+    write_timeout_seconds: 5
+    idle_timeout_seconds: 30
+    # api_key 只走 .env 的 VOICE_REALTIME_API_KEY，禁止写入 YAML。
 
 # 文字转语音（TTS）：让费曼提问和追问出声，把“实时 + 用耳朵听 + 有人等”的面试条件复现出来。
 # 念的文本全部由本系统生成，不含用户上传内容，因此不需要可信度判断。
