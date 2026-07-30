@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "build": "vite build",
-    "dev": "vite"
+    "dev": "vite",
+    "test:audio": "node --test src/app/lib/pcm-capture.test.ts"
   },
   "dependencies": {
     "@emotion/react": "11.14.0",
