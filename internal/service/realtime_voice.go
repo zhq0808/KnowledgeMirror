@@ -108,6 +108,7 @@ type RealtimeVoiceService struct {
 type RealtimeVoiceReservation struct {
 	service  *RealtimeVoiceService
 	userID   string
+	consumed bool
 	released bool
 	mu       sync.Mutex
 }
@@ -163,12 +164,13 @@ func (s *RealtimeVoiceService) RunReserved(ctx context.Context, reservation *Rea
 		return VoiceCapture{}, invalidVoiceInput("实时语音并发额度无效")
 	}
 	reservation.mu.Lock()
-	reservationReleased := reservation.released
+	if reservation.released || reservation.consumed {
+		reservation.mu.Unlock()
+		return VoiceCapture{}, invalidVoiceInput("实时语音并发额度已失效")
+	}
+	reservation.consumed = true
 	userID := reservation.userID
 	reservation.mu.Unlock()
-	if reservationReleased {
-		return VoiceCapture{}, invalidVoiceInput("实时语音并发额度已释放")
-	}
 	defer reservation.Release()
 
 	userID = strings.TrimSpace(userID)

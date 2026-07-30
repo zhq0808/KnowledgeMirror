@@ -2,7 +2,7 @@ package handler
 
 import (
 	"context"
-	"errors"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -289,15 +289,26 @@ func readRealtimeEvent(t *testing.T, conn *websocket.Conn) realtimeVoiceServerEv
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
 	var event realtimeVoiceServerEvent
-	if err := websocket.Read(ctx, conn, &event); err != nil {
+	messageType, payload, err := conn.Read(ctx)
+	if err != nil {
 		t.Fatalf("read realtime event: %v", err)
+	}
+	if messageType != websocket.MessageText {
+		t.Fatalf("message type = %v, want text", messageType)
+	}
+	if err := json.Unmarshal(payload, &event); err != nil {
+		t.Fatalf("decode realtime event: %v", err)
 	}
 	return event
 }
 
 func writeStop(t *testing.T, conn *websocket.Conn) {
 	t.Helper()
-	if err := websocket.Write(t.Context(), conn, realtimeVoiceClientControl{Type: "stop"}); err != nil {
+	payload, err := json.Marshal(realtimeVoiceClientControl{Type: "stop"})
+	if err != nil {
+		t.Fatalf("encode stop: %v", err)
+	}
+	if err := conn.Write(t.Context(), websocket.MessageText, payload); err != nil {
 		t.Fatalf("write stop: %v", err)
 	}
 }
@@ -314,5 +325,3 @@ func readUntilCompleted(t *testing.T, conn *websocket.Conn) realtimeVoiceServerE
 		}
 	}
 }
-
-var _ = errors.Is
