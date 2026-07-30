@@ -6,7 +6,9 @@
   "scripts": {
     "build": "vite build",
     "dev": "vite",
-    "test:audio": "node --test src/app/lib/pcm-capture.test.ts"
+    "test:audio": "node --test src/app/lib/pcm-capture.test.ts",
+    "test:realtime": "node --test src/app/lib/realtime-transcription.test.ts",
+    "test:front": "node --test src/app/lib/pcm-capture.test.ts src/app/lib/realtime-transcription.test.ts"
   },
   "dependencies": {
     "@emotion/react": "11.14.0",

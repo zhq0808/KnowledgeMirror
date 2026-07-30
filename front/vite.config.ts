@@ -47,7 +47,10 @@ export default defineConfig({
     strictPort: true,
     // 开发时把后端请求透传到 Go 服务(8091)，前端直接调 /api、/health 即可，免跨域
     proxy: {
-      '/api': 'http://127.0.0.1:8091',
+      '/api': {
+        target: 'http://127.0.0.1:8091',
+        ws: true,
+      },
       '/health': 'http://127.0.0.1:8091',
     },
   },
