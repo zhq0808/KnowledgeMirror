@@ -76,7 +76,9 @@ export function voiceConfirmationHint(capture: VoiceCapture): string {
   }
 }
 
-// uploadVoiceCapture 上传一段录音并同步拿回转写。
+// uploadVoiceCapture 是旧文件式录音链路的显式兼容能力。
+// InputDock 的实时失败不能静默调用它；只有明确选择兼容模式的调用方才能使用。
+// 上传一段完整录音并同步拿回转写。
 // 转写失败时后端同样返回 200 + status=failed（录音这件事确实发生了），
 // 因此调用方要看 status，不能只靠 try/catch 判断成败。
 export async function uploadVoiceCapture(

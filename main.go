@@ -407,6 +407,7 @@ func run() error {
 				WriteTimeout:         time.Duration(cfg.Voice.Realtime.WriteTimeoutSeconds) * time.Second,
 				IdleTimeout:          time.Duration(cfg.Voice.Realtime.IdleTimeoutSeconds) * time.Second,
 			},
+			log,
 		)
 		log.Info("实时语音输入已启用", "stt_provider", realtimeProvider.Name(), "model", realtimeProvider.Model())
 	} else if cfg.Voice.Realtime.Enabled {

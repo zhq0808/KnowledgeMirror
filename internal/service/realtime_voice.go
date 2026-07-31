@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -97,10 +99,36 @@ type RealtimeVoiceService struct {
 	provider  stt.RealtimeProvider
 	finalizer RealtimeVoiceFinalizer
 	limits    RealtimeVoiceLimits
+	log       *slog.Logger
+	metrics   realtimeVoiceMetrics
 
 	mu          sync.Mutex
 	active      int
 	activeUsers map[string]int
+}
+
+type realtimeVoiceMetrics struct {
+	rejectedUser             atomic.Int64
+	rejectedInstance         atomic.Int64
+	firstTranscriptCount     atomic.Int64
+	firstTranscriptLatencyMS atomic.Int64
+	finishCount              atomic.Int64
+	finishLatencyMS          atomic.Int64
+	audioDurationMS          atomic.Int64
+	upstreamErrors           atomic.Int64
+}
+
+// RealtimeVoiceMetrics is a text-free snapshot suitable for metrics export.
+type RealtimeVoiceMetrics struct {
+	ActiveStreams                 int
+	RejectedUserLimit             int64
+	RejectedInstanceLimit         int64
+	FirstTranscriptCount          int64
+	FirstTranscriptLatencyTotalMS int64
+	FinishCount                   int64
+	FinishLatencyTotalMS          int64
+	AudioDurationTotalMS          int64
+	UpstreamErrors                int64
 }
 
 // RealtimeVoiceReservation atomically holds one user and instance stream slot.
@@ -113,15 +141,37 @@ type RealtimeVoiceReservation struct {
 	mu       sync.Mutex
 }
 
-func NewRealtimeVoiceService(provider stt.RealtimeProvider, finalizer RealtimeVoiceFinalizer, limits RealtimeVoiceLimits) *RealtimeVoiceService {
+func NewRealtimeVoiceService(provider stt.RealtimeProvider, finalizer RealtimeVoiceFinalizer, limits RealtimeVoiceLimits, logs ...*slog.Logger) *RealtimeVoiceService {
 	limits = normalizeRealtimeVoiceLimits(limits)
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if len(logs) > 0 && logs[0] != nil {
+		log = logs[0]
+	}
 	return &RealtimeVoiceService{
-		provider: provider, finalizer: finalizer, limits: limits,
+		provider: provider, finalizer: finalizer, limits: limits, log: log,
 		activeUsers: make(map[string]int),
 	}
 }
 
 func (s *RealtimeVoiceService) Limits() RealtimeVoiceLimits { return s.limits }
+
+// Metrics returns aggregate counters without audio, transcript text, credentials, or user identifiers.
+func (s *RealtimeVoiceService) Metrics() RealtimeVoiceMetrics {
+	s.mu.Lock()
+	active := s.active
+	s.mu.Unlock()
+	return RealtimeVoiceMetrics{
+		ActiveStreams:                 active,
+		RejectedUserLimit:             s.metrics.rejectedUser.Load(),
+		RejectedInstanceLimit:         s.metrics.rejectedInstance.Load(),
+		FirstTranscriptCount:          s.metrics.firstTranscriptCount.Load(),
+		FirstTranscriptLatencyTotalMS: s.metrics.firstTranscriptLatencyMS.Load(),
+		FinishCount:                   s.metrics.finishCount.Load(),
+		FinishLatencyTotalMS:          s.metrics.finishLatencyMS.Load(),
+		AudioDurationTotalMS:          s.metrics.audioDurationMS.Load(),
+		UpstreamErrors:                s.metrics.upstreamErrors.Load(),
+	}
+}
 
 func (s *RealtimeVoiceService) Run(ctx context.Context, userID, sessionID, streamID string, stream RealtimeVoiceStream) (VoiceCapture, error) {
 	reservation, err := s.Reserve(userID)
@@ -188,16 +238,43 @@ func (s *RealtimeVoiceService) RunReserved(ctx context.Context, reservation *Rea
 		return VoiceCapture{}, errors.New("实时语音供应商返回空会话")
 	}
 	defer session.Close()
+	startedAt := time.Now()
+	resultCode := "completed"
+	var audioDurationMS int
+	var firstTranscriptLatencyMS atomic.Int64
+	var finishLatencyMS atomic.Int64
+	firstTranscriptLatencyMS.Store(-1)
+	finishLatencyMS.Store(-1)
+	defer func() {
+		attributes := []any{
+			"stream_id", streamID,
+			"provider", s.provider.Name(),
+			"model", s.provider.Model(),
+			"result_code", resultCode,
+			"audio_duration_ms", audioDurationMS,
+			"first_transcript_latency_ms", firstTranscriptLatencyMS.Load(),
+			"finish_latency_ms", finishLatencyMS.Load(),
+			"active_streams", s.Metrics().ActiveStreams,
+		}
+		if resultCode == "completed" {
+			s.log.Info("实时语音流结束", attributes...)
+		} else {
+			s.log.Warn("实时语音流结束", attributes...)
+		}
+	}()
 
 	startCtx, startCancel := context.WithTimeout(ctx, s.limits.StartTimeout)
 	err := session.Start(startCtx)
 	startCancel()
 	if err != nil {
+		resultCode = realtimeVoiceErrorCode(err)
+		s.metrics.upstreamErrors.Add(1)
 		return VoiceCapture{}, err
 	}
 	if err := s.writeEvent(ctx, stream, RealtimeVoiceEvent{
 		Type: RealtimeVoiceEventReady, StreamID: streamID, SampleRate: s.limits.SampleRate,
 	}); err != nil {
+		resultCode = realtimeVoiceErrorCode(err)
 		return VoiceCapture{}, err
 	}
 
@@ -206,20 +283,28 @@ func (s *RealtimeVoiceService) RunReserved(ctx context.Context, reservation *Rea
 	group, groupCtx := errgroup.WithContext(runCtx)
 	audioQueue := make(chan []byte, s.limits.AudioQueueFrames)
 	eventQueue := newRealtimeVoiceEventQueue(s.limits.EventQueueSize)
-	startedAt := time.Now()
 	var pcm []byte
 	aggregator := newRealtimeTranscriptAggregator()
+	var stopAt atomic.Int64
+	var firstTranscript sync.Once
 
 	group.Go(func() error {
 		defer close(audioQueue)
-		return s.readBrowser(groupCtx, stream, audioQueue, &pcm, startedAt)
+		return s.readBrowser(groupCtx, stream, audioQueue, &pcm, startedAt, &stopAt)
 	})
 	group.Go(func() error {
 		return s.writeUpstream(groupCtx, session, audioQueue)
 	})
 	group.Go(func() error {
 		defer eventQueue.Close()
-		return s.readUpstream(groupCtx, session, eventQueue, aggregator)
+		return s.readUpstream(groupCtx, session, eventQueue, aggregator, func() {
+			firstTranscript.Do(func() {
+				latency := time.Since(startedAt).Milliseconds()
+				firstTranscriptLatencyMS.Store(latency)
+				s.metrics.firstTranscriptCount.Add(1)
+				s.metrics.firstTranscriptLatencyMS.Add(latency)
+			})
+		})
 	})
 
 	var downstreamErr error
@@ -238,9 +323,17 @@ func (s *RealtimeVoiceService) RunReserved(ctx context.Context, reservation *Rea
 	if downstreamErr != nil {
 		groupErr = downstreamErr
 	}
+	if stoppedAt := stopAt.Load(); stoppedAt > 0 {
+		latency := time.Since(time.Unix(0, stoppedAt)).Milliseconds()
+		finishLatencyMS.Store(latency)
+		s.metrics.finishCount.Add(1)
+		s.metrics.finishLatencyMS.Add(latency)
+	}
 
 	wav := encodePCM16WAV(pcm, s.limits.SampleRate)
 	durationMS := pcmDurationMS(len(pcm), s.limits.SampleRate)
+	audioDurationMS = durationMS
+	s.metrics.audioDurationMS.Add(int64(durationMS))
 	finalizeInput := FinalizeRealtimeInput{
 		UserID: userID, SessionID: sessionID, WAV: wav,
 		Transcript: aggregator.FinalText(), Provider: s.provider.Name(), Model: s.provider.Model(),
@@ -251,9 +344,14 @@ func (s *RealtimeVoiceService) RunReserved(ctx context.Context, reservation *Rea
 	}
 	if groupErr != nil {
 		finalizeInput.TranscriptError = realtimeVoiceAuditError(groupErr)
+		resultCode = finalizeInput.TranscriptError
+		if isRealtimeVoiceUpstreamError(groupErr) {
+			s.metrics.upstreamErrors.Add(1)
+		}
 	}
 	capture, finalizeErr := s.finalizer.FinalizeRealtime(ctx, finalizeInput)
 	if finalizeErr != nil {
+		resultCode = "finalize_failed"
 		return VoiceCapture{}, finalizeErr
 	}
 
@@ -271,6 +369,7 @@ func (s *RealtimeVoiceService) RunReserved(ctx context.Context, reservation *Rea
 	}
 	if capture.Status != VoiceCaptureStatusTranscribed {
 		err := errors.New("实时 STT 返回空最终文本")
+		resultCode = "empty_transcript"
 		if writeErr := s.writeEvent(ctx, stream, RealtimeVoiceEvent{
 			Type: RealtimeVoiceEventError, Code: "empty_transcript", Message: err.Error(), Retryable: true,
 		}); writeErr != nil {
@@ -284,7 +383,7 @@ func (s *RealtimeVoiceService) RunReserved(ctx context.Context, reservation *Rea
 	return capture, nil
 }
 
-func (s *RealtimeVoiceService) readBrowser(ctx context.Context, stream RealtimeVoiceStream, audioQueue chan<- []byte, pcm *[]byte, startedAt time.Time) error {
+func (s *RealtimeVoiceService) readBrowser(ctx context.Context, stream RealtimeVoiceStream, audioQueue chan<- []byte, pcm *[]byte, startedAt time.Time, stopAt *atomic.Int64) error {
 	var acceptedBytes int64
 	for {
 		remaining := s.limits.MaxDuration - time.Since(startedAt)
@@ -318,6 +417,7 @@ func (s *RealtimeVoiceService) readBrowser(ctx context.Context, stream RealtimeV
 		}
 		switch input.Type {
 		case RealtimeVoiceInputStop:
+			stopAt.CompareAndSwap(0, time.Now().UnixNano())
 			return nil
 		case RealtimeVoiceInputCancel:
 			return ErrRealtimeVoiceUserCancelled
@@ -374,7 +474,7 @@ func (s *RealtimeVoiceService) writeUpstream(ctx context.Context, session stt.Re
 	}
 }
 
-func (s *RealtimeVoiceService) readUpstream(ctx context.Context, session stt.RealtimeSession, queue *realtimeVoiceEventQueue, aggregator *realtimeTranscriptAggregator) error {
+func (s *RealtimeVoiceService) readUpstream(ctx context.Context, session stt.RealtimeSession, queue *realtimeVoiceEventQueue, aggregator *realtimeTranscriptAggregator, observeTranscript func()) error {
 	var seq int64
 	for {
 		select {
@@ -390,6 +490,7 @@ func (s *RealtimeVoiceService) readUpstream(ctx context.Context, session stt.Rea
 				if !accepted {
 					continue
 				}
+				observeTranscript()
 				seq++
 				out := RealtimeVoiceEvent{
 					Type: RealtimeVoiceEventTranscript, Seq: seq, SentenceID: sentenceID,
@@ -429,9 +530,13 @@ func (s *RealtimeVoiceService) acquire(userID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.activeUsers[userID] >= s.limits.MaxStreamsPerUser {
+		s.metrics.rejectedUser.Add(1)
+		s.log.Warn("实时语音流被拒绝", "reason", "user_limit", "active_streams", s.active)
 		return ErrRealtimeVoiceUserLimit
 	}
 	if s.active >= s.limits.MaxConcurrentStreams {
+		s.metrics.rejectedInstance.Add(1)
+		s.log.Warn("实时语音流被拒绝", "reason", "instance_limit", "active_streams", s.active)
 		return ErrRealtimeVoiceInstanceLimit
 	}
 	s.active++
@@ -701,5 +806,14 @@ func realtimeVoiceErrorCode(err error) string {
 		return "user_cancelled"
 	default:
 		return "upstream_failed"
+	}
+}
+
+func isRealtimeVoiceUpstreamError(err error) bool {
+	switch realtimeVoiceErrorCode(err) {
+	case "upstream_failed", "upstream_slow", "finish_timeout":
+		return true
+	default:
+		return false
 	}
 }

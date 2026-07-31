@@ -2,13 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { Mic, Send, Plus, Square, Sparkles, ChevronDown, Check, X } from "lucide-react";
 import type { ModelOption } from "../api/chat";
-import { encodeRecordingAsWav, recordingUnavailableReason } from "../lib/audio";
-import {
-  getVoiceAlwaysConfirm,
-  setVoiceAlwaysConfirm,
-  voiceConfirmationHint,
-  type VoiceCapture,
-} from "../api/voice";
+import { useRealtimeTranscription } from "../lib/useRealtimeTranscription";
 
 const PROMPTS = [
   { emoji: "🧠", label: "费曼学习" },
@@ -17,16 +11,11 @@ const PROMPTS = [
   { emoji: "🎯", label: "JD 分析" },
 ];
 
-// 录音时长上限与后端 voice.max_duration_ms 保持一致：
-// 前端到点自动停，好过让用户讲完一大段才被后端拒掉。
-const maxRecordingMs = 180000;
-
 interface InputDockProps {
   // onSendMessage 的 voiceCaptureID 只在这条消息来自语音时带上，
   // 用于把原始转写和用户最终发出的文本关联起来。
   onSendMessage: (message: string, voiceCaptureID?: string) => void;
-  // onVoiceCapture 上传一段录音并返回转写结果；为空时语音入口不可用。
-  onVoiceCapture?: (audio: Blob, durationMs: number) => Promise<VoiceCapture>;
+  sessionID: string | null;
   onSelectPrompt: (prompt: { emoji: string; label: string }) => void;
   activePrompt?: string;
   voiceDisabled?: boolean;
@@ -42,7 +31,7 @@ interface InputDockProps {
 
 export function InputDock({
   onSendMessage,
-  onVoiceCapture,
+  sessionID,
   onSelectPrompt,
   activePrompt,
   voiceDisabled = false,
@@ -58,34 +47,21 @@ export function InputDock({
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textInputRef = useRef<HTMLInputElement>(null);
-
-  // 语音状态机：idle -> requesting（申请麦克风）-> recording -> uploading -> idle。
-  const [voiceState, setVoiceState] = useState<"idle" | "requesting" | "recording" | "uploading">("idle");
-  const [elapsedMs, setElapsedMs] = useState(0);
-  const [voiceError, setVoiceError] = useState("");
-  // pendingCapture 非空 = 这段转写还没发出去，正等用户看一眼。
-  const [pendingCapture, setPendingCapture] = useState<VoiceCapture | null>(null);
-  const [alwaysConfirm, setAlwaysConfirm] = useState(false);
-
-  const recorderRef = useRef<MediaRecorder | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
-  const startedAtRef = useRef(0);
-  const timerRef = useRef<number | null>(null);
+  const realtime = useRealtimeTranscription();
+  const voiceBusy =
+    realtime.status === "connecting" ||
+    realtime.status === "ready" ||
+    realtime.status === "streaming" ||
+    realtime.status === "stopping";
 
   useEffect(() => {
-    setAlwaysConfirm(getVoiceAlwaysConfirm());
-    return () => {
-      if (timerRef.current !== null) window.clearInterval(timerRef.current);
-      const recorder = recorderRef.current;
-      if (recorder && recorder.state !== "inactive") {
-        recorder.ondataavailable = null;
-        recorder.onstop = null;
-        recorder.stop();
-      }
-      streamRef.current?.getTracks().forEach((track) => track.stop());
-    };
-  }, []);
+    if (realtime.status !== "idle") setInput(realtime.text);
+  }, [realtime.status, realtime.text]);
+
+  useEffect(() => {
+    realtime.reset("");
+    setInput("");
+  }, [sessionID, realtime.reset]);
 
   const selectedModel =
     models.find((m) => m.id === selectedModelID) ?? models[0];
@@ -93,15 +69,15 @@ export function InputDock({
   const submitText = (text: string) => {
     // 只有这次发送确实来自录音时才带 capture_id；
     // 用户把转写改得面目全非也没关系，原始转写在后端原样存着，谁也没覆盖谁。
-    onSendMessage(text, pendingCapture?.capture_id);
+    const voiceCaptureID = realtime.voiceCaptureID ?? undefined;
     setInput("");
-    setPendingCapture(null);
-    setVoiceError("");
+    realtime.reset("");
+    onSendMessage(text, voiceCaptureID);
   };
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (input.trim()) submitText(input.trim());
+    if (!voiceBusy && input.trim()) submitText(input.trim());
   };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -113,109 +89,53 @@ export function InputDock({
     e.target.value = "";
   };
 
-  const uploadRecording = async (blob: Blob, durationMs: number) => {
-    if (!onVoiceCapture) return;
-    setVoiceState("uploading");
-    try {
-      // 浏览器只能录出 webm/opus 这类压缩格式，而 STT 供应商只收 wav/mp3，
-      // 所以这里必须先转一道码再上传；失败时抛出的就是给用户看的话。
-      const wav = await encodeRecordingAsWav(blob);
-      const capture = await onVoiceCapture(wav, durationMs);
-      if (capture.status === "failed" || !capture.transcript) {
-        // 失败不清空输入框：用户可能已经先打了一半字。
-        setVoiceError(voiceConfirmationHint(capture) || "没能听清这段话，可以重录或直接打字");
-        setPendingCapture(null);
-        return;
-      }
-      // 默认直接发送：讲完一句还要手动确认一次，语音就比打字还累了。
-      // 只有后端拿出明确证据（置信度低／术语可疑），或用户自己选了“每次都先确认”，才停一下。
-      if (!capture.needs_confirmation && !alwaysConfirm) {
-        setPendingCapture(null);
-        setVoiceError("");
-        onSendMessage(capture.transcript, capture.capture_id);
-        return;
-      }
-      setInput(capture.transcript);
-      setPendingCapture(capture);
-      setVoiceError("");
-      window.setTimeout(() => textInputRef.current?.focus(), 0);
-    } catch (uploadError) {
-      setVoiceError(uploadError instanceof Error ? uploadError.message : "语音转写失败");
-      setPendingCapture(null);
-    } finally {
-      setVoiceState("idle");
-      setElapsedMs(0);
-    }
+  const stopRealtime = () => {
+    void realtime.stop();
   };
 
-  const stopRecording = () => {
-    const recorder = recorderRef.current;
-    if (recorder && recorder.state !== "inactive") recorder.stop();
+  const startRealtime = () => {
+    if (!sessionID || voiceDisabled || voiceBusy) return;
+    realtime.start(sessionID, input);
   };
 
-  const startRecording = async () => {
-    if (!onVoiceCapture || voiceDisabled || voiceState !== "idle") return;
-    const unavailable = recordingUnavailableReason();
-    if (unavailable) {
-      setVoiceError(unavailable);
-      return;
-    }
-    setVoiceError("");
-    setVoiceState("requesting");
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
-      const preferred = ["audio/webm;codecs=opus", "audio/mp4", "audio/ogg;codecs=opus"].find((type) =>
-        MediaRecorder.isTypeSupported(type),
-      );
-      const recorder = new MediaRecorder(stream, preferred ? { mimeType: preferred } : undefined);
-      recorderRef.current = recorder;
-      chunksRef.current = [];
-      recorder.ondataavailable = (event) => {
-        if (event.data.size > 0) chunksRef.current.push(event.data);
-      };
-      recorder.onstop = () => {
-        const durationMs = Math.max(1, Date.now() - startedAtRef.current);
-        if (timerRef.current !== null) window.clearInterval(timerRef.current);
-        timerRef.current = null;
-        stream.getTracks().forEach((track) => track.stop());
-        const blob = new Blob(chunksRef.current, {
-          type: recorder.mimeType || chunksRef.current[0]?.type || "audio/webm",
-        });
-        if (blob.size > 0) {
-          void uploadRecording(blob, durationMs);
-        } else {
-          setVoiceState("idle");
-          setElapsedMs(0);
-        }
-      };
-      startedAtRef.current = Date.now();
-      setElapsedMs(0);
-      recorder.start(250);
-      setVoiceState("recording");
-      timerRef.current = window.setInterval(() => {
-        const elapsed = Date.now() - startedAtRef.current;
-        setElapsedMs(elapsed);
-        if (elapsed >= maxRecordingMs) stopRecording();
-      }, 200);
-    } catch (recordError) {
-      streamRef.current?.getTracks().forEach((track) => track.stop());
-      setVoiceState("idle");
-      setVoiceError(
-        recordError instanceof DOMException && recordError.name === "NotAllowedError"
-          ? "麦克风权限被拒绝，请在浏览器设置中允许后重试"
-          : "无法启动录音",
-      );
-    }
+  const stopResponding = () => {
+    realtime.reset(input);
+    onStop();
   };
 
-  const isRecording = voiceState === "recording";
-  const micDisabled =
-    voiceDisabled || !onVoiceCapture || voiceState === "requesting" || voiceState === "uploading";
+  const canStopRealtime =
+    realtime.status === "connecting" ||
+    realtime.status === "ready" ||
+    realtime.status === "streaming";
+  const micDisabled = voiceDisabled || !sessionID || realtime.status === "stopping";
   const micTitle =
     voiceTitle ??
-    (isRecording ? "停止录音" : voiceState === "uploading" ? "正在转写…" : "语音输入");
-  const confirmHint = pendingCapture ? voiceConfirmationHint(pendingCapture) : "";
+    (canStopRealtime
+      ? "停止听写"
+      : realtime.status === "stopping"
+        ? "正在收尾"
+        : realtime.status === "review"
+          ? "重新听写"
+          : "实时语音输入");
+
+  const voiceStatusText = (() => {
+    switch (realtime.status) {
+      case "connecting":
+        return "正在连接实时转写…";
+      case "ready":
+        return "麦克风已就绪，正在开始听写…";
+      case "streaming":
+        return "正在听写，文字会实时显示";
+      case "stopping":
+        return "正在收尾，请稍候…";
+      case "review":
+        return "转写完成，可修改后发送";
+      case "failed":
+        return realtime.error || "实时转写失败，可保留当前文字或重新听写";
+      default:
+        return "";
+    }
+  })();
 
   return (
     <div className="absolute bottom-[80px] left-0 right-0 z-30 bg-gradient-to-t from-[#F6F8F4] via-[#F6F8F4]/96 to-transparent px-5 pb-4 pt-8">
@@ -297,69 +217,42 @@ export function InputDock({
         </div>
       </div>
 
-      {/* 语音状态条：录音中的计时、转写中的等待、失败提示、以及需要确认时的说明。 */}
-      <AnimatePresence>
-        {(isRecording || voiceState === "uploading" || voiceError || pendingCapture) && (
-          <motion.div
-            initial={{ opacity: 0, y: 6 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: 6 }}
-            transition={{ duration: 0.15 }}
-            className="mb-2 rounded-2xl bg-white px-4 py-2.5 shadow-[0_2px_12px_rgba(0,0,0,0.05)]"
+      {/* 状态条只描述实时链路；转写正文始终显示在原输入框中。 */}
+      {realtime.status !== "idle" && (
+        <motion.div
+          initial={{ opacity: 0, y: 6 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.15 }}
+          className="mb-2 rounded-2xl bg-white px-4 py-2.5 shadow-[0_2px_12px_rgba(0,0,0,0.05)]"
+        >
+          <div
+            className={`flex min-h-4 items-center gap-2 text-xs ${
+              realtime.status === "failed" ? "text-[#C0603A]" : "text-gray-600"
+            }`}
           >
-            {isRecording ? (
-              <div className="flex items-center gap-2 text-xs text-gray-600">
-                <span className="h-2 w-2 flex-shrink-0 animate-pulse rounded-full bg-[#F4A460]" />
-                <span>正在录音 {(elapsedMs / 1000).toFixed(1)}s</span>
-                <span className="ml-auto text-gray-400">再次点击麦克风结束</span>
-              </div>
-            ) : voiceState === "uploading" ? (
-              <div className="text-xs text-gray-500">正在转写…</div>
-            ) : voiceError ? (
-              <div className="flex items-start gap-2 text-xs text-[#C0603A]">
-                <span className="flex-1">{voiceError}</span>
-                <button
-                  type="button"
-                  onClick={() => setVoiceError("")}
-                  aria-label="关闭提示"
-                  className="flex-shrink-0 text-gray-400 hover:text-gray-600"
-                >
-                  <X size={13} />
-                </button>
-              </div>
-            ) : (
-              <div className="flex flex-col gap-1.5">
-                <div className="flex items-start gap-2 text-xs text-gray-600">
-                  <span className="flex-1">{confirmHint || "发送前先确认一下转写结果"}</span>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      // 放弃这次语音关联：文字留在输入框里，用户当普通输入继续用。
-                      setPendingCapture(null);
-                    }}
-                    aria-label="忽略提示"
-                    className="flex-shrink-0 text-gray-400 hover:text-gray-600"
-                  >
-                    <X size={13} />
-                  </button>
-                </div>
-                <label className="flex items-center gap-1.5 text-[11px] text-gray-400">
-                  <input
-                    type="checkbox"
-                    checked={alwaysConfirm}
-                    onChange={(e) => {
-                      setAlwaysConfirm(e.target.checked);
-                      setVoiceAlwaysConfirm(e.target.checked);
-                    }}
-                    className="h-3 w-3 accent-[#A8D5BA]"
-                  />
-                  每次语音都先确认再发送
-                </label>
-              </div>
+            {(realtime.status === "connecting" ||
+              realtime.status === "ready" ||
+              realtime.status === "streaming" ||
+              realtime.status === "stopping") && (
+              <span className="h-2 w-2 flex-shrink-0 animate-pulse rounded-full bg-[#F4A460]" />
             )}
-          </motion.div>
-        )}
-      </AnimatePresence>
+            <span className="min-w-0 flex-1 truncate">{voiceStatusText}</span>
+            {realtime.status === "streaming" && (
+              <span className="flex-shrink-0 text-gray-400">点击麦克风结束</span>
+            )}
+            {realtime.status === "failed" && (
+              <button
+                type="button"
+                onClick={() => realtime.reset(input)}
+                aria-label="关闭提示"
+                className="flex-shrink-0 text-gray-400 hover:text-gray-600"
+              >
+                <X size={13} />
+              </button>
+            )}
+          </div>
+        </motion.div>
+      )}
 
       <form onSubmit={handleSubmit} className="flex items-center gap-2.5">
         <input
@@ -386,11 +279,13 @@ export function InputDock({
             type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
+            readOnly={voiceBusy}
+            aria-readonly={voiceBusy}
             placeholder="输入想练习的知识点或面试问题..."
-            className="w-full bg-white rounded-full px-5 py-3.5 pr-12 shadow-[0_2px_20px_rgba(0,0,0,0.06)] focus:outline-none focus:ring-2 focus:ring-[#A8D5BA]/30 transition-shadow text-sm"
+            className="w-full bg-white rounded-full px-5 py-3.5 pr-12 shadow-[0_2px_20px_rgba(0,0,0,0.06)] focus:outline-none focus:ring-2 focus:ring-[#A8D5BA]/30 transition-shadow text-sm read-only:cursor-default"
           />
           <AnimatePresence>
-            {input && (
+            {input && !voiceBusy && (
               <motion.button
                 type="submit"
                 initial={{ opacity: 0, scale: 0.7 }}
@@ -408,7 +303,7 @@ export function InputDock({
         {isResponding ? (
           <motion.button
             type="button"
-            onClick={onStop}
+            onClick={stopResponding}
             aria-label="停止回答"
             title="停止回答"
             initial={{ scale: 0.8, opacity: 0 }}
@@ -421,22 +316,22 @@ export function InputDock({
           <motion.button
             type="button"
             onClick={() => {
-              if (isRecording) {
-                stopRecording();
+              if (canStopRealtime) {
+                stopRealtime();
                 return;
               }
-              void startRecording();
+              startRealtime();
             }}
             disabled={micDisabled}
-            aria-label={isRecording ? "停止录音" : "语音输入"}
+            aria-label={canStopRealtime ? "停止听写" : "实时语音输入"}
             title={micTitle}
             className={`w-11 h-11 rounded-full flex items-center justify-center shadow-[0_2px_16px_rgba(0,0,0,0.07)] transition-colors flex-shrink-0 ${
-              isRecording
+              canStopRealtime
                 ? "bg-[#F4A460] text-white"
                 : "bg-white text-gray-500 hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-40"
             }`}
           >
-            {isRecording ? <Square className="h-4 w-4" fill="currentColor" /> : <Mic className="w-[18px] h-[18px]" />}
+            {canStopRealtime ? <Square className="h-4 w-4" fill="currentColor" /> : <Mic className="w-[18px] h-[18px]" />}
           </motion.button>
         )}
       </form>

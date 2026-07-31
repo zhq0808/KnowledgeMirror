@@ -1,9 +1,12 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -197,6 +200,55 @@ func TestRealtimeVoiceNormalStopDrainsAudioAndIncludesFinishFinal(t *testing.T) 
 	}
 }
 
+func TestRealtimeVoiceMetricsAndLogsExcludeSensitivePayloads(t *testing.T) {
+	session := newFakeRealtimeSession()
+	session.events <- stt.TranscriptEvent{Type: stt.TranscriptEventResult, Text: "绝不能写入日志的转写正文", BeginTimeMS: 0}
+	session.events <- stt.TranscriptEvent{Type: stt.TranscriptEventResult, Text: "最终文本", SentenceEnd: true, BeginTimeMS: 0}
+	stream := newFakeRealtimeStream(
+		RealtimeVoiceInput{Type: RealtimeVoiceInputAudio, PCM: make([]byte, 3200)},
+		RealtimeVoiceInput{Type: RealtimeVoiceInputStop},
+	)
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+	limits := testRealtimeLimits()
+	limits.MaxAudioBytes = 4096
+	service := NewRealtimeVoiceService(&fakeRealtimeProvider{session: session}, &recordingRealtimeFinalizer{}, limits, logger)
+
+	if _, err := service.Run(context.Background(), "usr_sensitive", "session_sensitive", "stream_1", stream); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	reservation, err := service.Reserve("usr_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Reserve("usr_1"); !errors.Is(err, ErrRealtimeVoiceUserLimit) {
+		t.Fatalf("same-user Reserve() error = %v, want user limit", err)
+	}
+	reservation.Release()
+
+	metrics := service.Metrics()
+	if metrics.ActiveStreams != 0 || metrics.RejectedUserLimit != 1 || metrics.RejectedInstanceLimit != 0 {
+		t.Fatalf("capacity metrics = %+v", metrics)
+	}
+	if metrics.FirstTranscriptCount != 1 || metrics.FinishCount != 1 || metrics.AudioDurationTotalMS != 100 {
+		t.Fatalf("latency/audio metrics = %+v", metrics)
+	}
+	if metrics.UpstreamErrors != 0 {
+		t.Fatalf("UpstreamErrors = %d, want 0", metrics.UpstreamErrors)
+	}
+	logText := logs.String()
+	for _, secret := range []string{"绝不能写入日志的转写正文", "最终文本", "usr_sensitive", "session_sensitive", "api-key"} {
+		if strings.Contains(logText, secret) {
+			t.Fatalf("log contains sensitive payload %q: %s", secret, logText)
+		}
+	}
+	for _, field := range []string{"stream_id", "result_code", "audio_duration_ms", "first_transcript_latency_ms", "finish_latency_ms"} {
+		if !strings.Contains(logText, field) {
+			t.Fatalf("log missing field %q: %s", field, logText)
+		}
+	}
+}
+
 func TestRealtimeVoiceFailurePathsFinalizeAndReleaseQuota(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -297,6 +349,14 @@ func TestRealtimeVoiceFailurePathsFinalizeAndReleaseQuota(t *testing.T) {
 			}
 			if service.active != 0 || len(service.activeUsers) != 0 {
 				t.Fatalf("失败后并发额度未释放: active=%d users=%v", service.active, service.activeUsers)
+			}
+			metrics := service.Metrics()
+			if testCase.wantAudit == "upstream_failed" || testCase.wantAudit == "upstream_slow" || testCase.wantAudit == "finish_timeout" {
+				if metrics.UpstreamErrors != 1 {
+					t.Fatalf("UpstreamErrors = %d, want 1 for %s", metrics.UpstreamErrors, testCase.wantAudit)
+				}
+			} else if metrics.UpstreamErrors != 0 {
+				t.Fatalf("UpstreamErrors = %d, want 0 for %s", metrics.UpstreamErrors, testCase.wantAudit)
 			}
 			session.mu.Lock()
 			closeCalls := session.closeCall

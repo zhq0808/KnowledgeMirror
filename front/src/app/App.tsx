@@ -38,7 +38,6 @@ import {
   type SessionMessage,
   type RetrievalSources,
 } from "./api/chat";
-import { uploadVoiceCapture } from "./api/voice";
 import { AuthPage } from "./pages/AuthPage";
 
 interface Message {
@@ -587,18 +586,6 @@ function InterviewWorkspace() {
     void handleSendMessage(`${prompt.emoji} ${prompt.label}`);
   };
 
-  // handleVoiceCapture 把一段录音变成文字。
-  // 转写完就结束了：后续发送、分析走的仍是和打字完全一样的那条链路，
-  // 语音只是输入法，不是第二套业务流程。
-  const handleVoiceCapture = async (audio: Blob, durationMs: number) => {
-    const sessionID = activeSessionID ?? (await ensureSessionID());
-    if (!activeSessionID) {
-      setActiveSessionID(sessionID);
-      rememberSessionID(sessionID);
-    }
-    return uploadVoiceCapture(sessionID, audio, durationMs);
-  };
-
   // handlePhoto 拍照/选图入口。图片识别后端管线尚未接入，先给出本地占位回复。
   const handlePhoto = (file: File) => {
     const base = Date.now().toString();
@@ -751,7 +738,7 @@ function InterviewWorkspace() {
             onSendMessage={(text, voiceCaptureID) => {
               void handleSendMessage(text, voiceCaptureID);
             }}
-            onVoiceCapture={handleVoiceCapture}
+            sessionID={activeSessionID}
             onSelectPrompt={handleSelectPracticePrompt}
             activePrompt={
               practiceState && practiceState.state !== "idle" ? "费曼学习" : undefined

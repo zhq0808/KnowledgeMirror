@@ -234,6 +234,47 @@ test("unexpected network close fails without discarding the latest interim", asy
   assert.equal(rig.controller.snapshot.voiceCaptureID, null);
 });
 
+test("microphone permission denial closes the socket and exposes a retryable-safe UI error", async () => {
+  const rig = createRig();
+  rig.controller = new RealtimeTranscriptionController({
+    createURL: (sessionID) => `ws://example.test/api/v1/voice/realtime?session_id=${sessionID}`,
+    createSocket: (url) => {
+      rig.urls.push(url);
+      const socket = new FakeSocket();
+      rig.sockets.push(socket);
+      return socket;
+    },
+    startCapture: async () => {
+      throw new Error("麦克风权限被拒绝，请在浏览器设置中允许后重试");
+    },
+  });
+
+  rig.controller.start("session-1", "保留前缀：");
+  const socket = rig.sockets[0];
+  socket.emit({ type: "ready", stream_id: "stream-1", sample_rate: 16000 });
+  await settle();
+
+  assert.equal(rig.controller.snapshot.status, "failed");
+  assert.equal(rig.controller.snapshot.text, "保留前缀：");
+  assert.match(rig.controller.snapshot.error, /麦克风权限被拒绝/);
+  assert.equal(rig.controller.snapshot.voiceCaptureID, null);
+  assert.equal(socket.closeCount, 1);
+});
+
+test("reset for a session switch releases the old stream and removes its transcript association", async () => {
+  const rig = createRig();
+  const oldSocket = await readyRig(rig, "A 会话：");
+  transcript(oldSocket, 1, 1, "不能带到 B 会话");
+
+  rig.controller.reset("");
+
+  assert.equal(rig.controller.snapshot.status, "idle");
+  assert.equal(rig.controller.snapshot.text, "");
+  assert.equal(rig.controller.snapshot.voiceCaptureID, null);
+  assert.equal(rig.captures[0].disposeCount, 1);
+  assert.equal(oldSocket.closeCount, 1);
+});
+
 test("dispose on component unmount releases microphone and WebSocket resources", async () => {
   const rig = createRig();
   const socket = await readyRig(rig);
