@@ -9,7 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"healthAgent/internal/service"
+	"KnowledgeMirror/internal/service"
 )
 
 // maxMemoryIDAttempts 限制 memory_id / history_id 生成的有限冲突重试次数。

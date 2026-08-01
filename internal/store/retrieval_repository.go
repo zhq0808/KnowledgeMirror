@@ -7,7 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"healthAgent/internal/service"
+	"KnowledgeMirror/internal/service"
 )
 
 // RetrievalExecutor 是检索仓储需要的最小 pgx 能力。

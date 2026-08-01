@@ -1,11 +1,25 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	"KnowledgeMirror/internal/llm"
 )
+
+type scriptedFeynmanCompletionModel struct {
+	contents []string
+	calls    [][]llm.Message
+}
+
+func (m *scriptedFeynmanCompletionModel) Complete(_ context.Context, messages []llm.Message) (llm.Completion, error) {
+	m.calls = append(m.calls, messages)
+	content := m.contents[len(m.calls)-1]
+	return llm.Completion{Content: content}, nil
+}
 
 func TestParseAnswerAnalysisResultRejectsMalformedOutput(t *testing.T) {
 	cases := []struct {
@@ -33,6 +47,28 @@ func TestParseAnswerAnalysisResultAcceptsCodeFence(t *testing.T) {
 	}
 	if !result.InsufficientSources || result.NextProbe != "再讲讲顺序性" {
 		t.Fatalf("解析结果不符: %+v", result)
+	}
+}
+
+func TestFeynmanAnswerAnalyzerRepairsInvalidStructuredOutputOnce(t *testing.T) {
+	model := &scriptedFeynmanCompletionModel{contents: []string{
+		`{"covered":[],"gaps":[],"next_probe":"","score":90}`,
+		`{"covered":["说明了幂等目的"],"insufficient_sources":true,"gaps":[],"next_probe":"再讲讲幂等键怎么选"}`,
+	}}
+	analyzer := &LLMFeynmanAnswerAnalyzer{model: model, systemPrompt: "只返回 JSON"}
+
+	result, err := analyzer.Analyze(context.Background(), AnswerAnalysisInput{Answer: "用业务键去重"})
+	if err != nil {
+		t.Fatalf("修复重试后仍然失败: %v", err)
+	}
+	if len(model.calls) != 2 {
+		t.Fatalf("非法结构应只触发一次修复重试，实际调用 %d 次", len(model.calls))
+	}
+	if len(model.calls[1]) != 4 || model.calls[1][2].Role != "assistant" {
+		t.Fatalf("修复请求必须携带上一条模型输出: %+v", model.calls[1])
+	}
+	if result.NextProbe != "再讲讲幂等键怎么选" {
+		t.Fatalf("修复结果不符: %+v", result)
 	}
 }
 

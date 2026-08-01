@@ -3,6 +3,7 @@ package stt
 import (
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"io"
@@ -137,6 +138,84 @@ func TestMiMoASRProviderTranscribe(t *testing.T) {
 	// MiMo 不返回置信度。留 nil 才能让上层继续要求用户确认，绝不能伪造成满分。
 	if transcript.Confidence != nil {
 		t.Fatalf("Confidence 应为 nil，实际 %v", *transcript.Confidence)
+	}
+}
+
+func TestMiMoASRProviderRejectsMarkerOnlyTranscript(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"silence","choices":[{"message":{"content":"think>\n<chinese>"}}]}`))
+	}))
+	defer server.Close()
+
+	provider := NewMiMoASRProvider("test-key", server.URL+"/v1", "", "zh", 5*time.Second)
+	transcript, err := provider.Transcribe(context.Background(), []byte("silent wav"), "audio/wav")
+	if err != nil {
+		t.Fatalf("静音响应归一化失败: %v", err)
+	}
+	if transcript.Text != "" {
+		t.Fatalf("控制标记不应成为转写正文: %q", transcript.Text)
+	}
+}
+
+func TestMiMoASRProviderRejectsDigitalSilenceBeforeRequest(t *testing.T) {
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requestCount++
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"模型幻听"}}]}`))
+	}))
+	defer server.Close()
+
+	provider := NewMiMoASRProvider("test-key", server.URL+"/v1", "", "zh", 5*time.Second)
+	transcript, err := provider.Transcribe(context.Background(), pcm16WAV(make([]byte, 32000)), "audio/wav")
+	if err != nil {
+		t.Fatalf("Transcribe() error = %v", err)
+	}
+	if requestCount != 0 || transcript.Text != "" {
+		t.Fatalf("数字静音不应调用供应商或产生正文: requests=%d transcript=%+v", requestCount, transcript)
+	}
+}
+
+func TestMiMoASRProviderAllowsNonzeroPCM16WAV(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"正常转写"}}]}`))
+	}))
+	defer server.Close()
+
+	pcm := make([]byte, 32000)
+	pcm[100] = 1
+	provider := NewMiMoASRProvider("test-key", server.URL+"/v1", "", "zh", 5*time.Second)
+	transcript, err := provider.Transcribe(context.Background(), pcm16WAV(pcm), "audio/wav")
+	if err != nil {
+		t.Fatalf("Transcribe() error = %v", err)
+	}
+	if transcript.Text != "正常转写" {
+		t.Fatalf("非零 PCM16 应继续调用供应商: %+v", transcript)
+	}
+}
+
+func pcm16WAV(pcm []byte) []byte {
+	wav := make([]byte, 44+len(pcm))
+	copy(wav[0:4], "RIFF")
+	binary.LittleEndian.PutUint32(wav[4:8], uint32(len(wav)-8))
+	copy(wav[8:12], "WAVE")
+	copy(wav[12:16], "fmt ")
+	binary.LittleEndian.PutUint32(wav[16:20], 16)
+	binary.LittleEndian.PutUint16(wav[20:22], 1)
+	binary.LittleEndian.PutUint16(wav[22:24], 1)
+	binary.LittleEndian.PutUint32(wav[24:28], 16000)
+	binary.LittleEndian.PutUint32(wav[28:32], 32000)
+	binary.LittleEndian.PutUint16(wav[32:34], 2)
+	binary.LittleEndian.PutUint16(wav[34:36], 16)
+	copy(wav[36:40], "data")
+	binary.LittleEndian.PutUint32(wav[40:44], uint32(len(pcm)))
+	copy(wav[44:], pcm)
+	return wav
+}
+
+func TestNormalizeMiMoASRTextPreservesRealText(t *testing.T) {
+	const text = "<chinese>真实正文"
+	if got := normalizeMiMoASRText("  " + text + "  "); got != text {
+		t.Fatalf("包含正文的输出不应被清洗: %q", got)
 	}
 }
 

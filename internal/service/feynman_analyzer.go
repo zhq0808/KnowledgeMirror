@@ -11,7 +11,7 @@ import (
 	"strings"
 	"text/template"
 
-	"healthAgent/internal/llm"
+	"KnowledgeMirror/internal/llm"
 )
 
 // ---------------------------------------------------------------------------
@@ -138,14 +138,30 @@ func (a *LLMFeynmanAnswerAnalyzer) Analyze(ctx context.Context, input AnswerAnal
 	if err != nil {
 		return AnswerAnalysisResult{}, err
 	}
-	completion, err := a.model.Complete(ctx, []llm.Message{
+	messages := []llm.Message{
 		{Role: "system", Content: a.systemPrompt},
 		{Role: "user", Content: string(rawInput)},
-	})
+	}
+	completion, err := a.model.Complete(ctx, messages)
 	if err != nil {
 		return AnswerAnalysisResult{}, err
 	}
-	return parseAnswerAnalysisResult([]byte(completion.Content))
+	result, err := parseAnswerAnalysisResult([]byte(completion.Content))
+	if err == nil || !errors.Is(err, ErrFeynmanAnalysisInvalid) {
+		return result, err
+	}
+
+	// 模型偶尔会在合法 JSON 外补一句解释或自作主张加字段。保留严格解析边界，
+	// 但只对这种可修复的格式漂移重试一次；上游错误和超时不重试，避免放大故障。
+	repairMessages := append(messages,
+		llm.Message{Role: "assistant", Content: completion.Content},
+		llm.Message{Role: "user", Content: "上一条输出不符合约定的 JSON 结构。请严格按系统消息中的输出格式重新输出，只返回一个 JSON 对象，不要添加未知字段、代码块或说明。"},
+	)
+	repaired, repairErr := a.model.Complete(ctx, repairMessages)
+	if repairErr != nil {
+		return AnswerAnalysisResult{}, repairErr
+	}
+	return parseAnswerAnalysisResult([]byte(repaired.Content))
 }
 
 func parseAnswerAnalysisResult(raw []byte) (AnswerAnalysisResult, error) {

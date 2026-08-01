@@ -6,8 +6,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"healthAgent/internal/service"
-	"healthAgent/internal/tts"
+	"KnowledgeMirror/internal/service"
+	"KnowledgeMirror/internal/tts"
 )
 
 // speechRequest 是语音合成请求体。

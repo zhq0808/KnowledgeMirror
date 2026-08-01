@@ -8,8 +8,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"healthAgent/internal/config"
-	"healthAgent/internal/store"
+	"KnowledgeMirror/internal/config"
+	"KnowledgeMirror/internal/store"
 )
 
 func TestPostgresSessionRepositoryListsOwnedSessionsDeterministically(t *testing.T) {

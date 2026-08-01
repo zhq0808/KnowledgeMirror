@@ -16,7 +16,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
-	"healthAgent/internal/service"
+	"KnowledgeMirror/internal/service"
 )
 
 const (
@@ -83,6 +83,8 @@ func (s *Server) realtimeVoiceHandler(c *gin.Context) {
 
 	reservation, err := s.realtimeVoice.Reserve(userID)
 	if err != nil {
+		s.log.WarnContext(c.Request.Context(), "实时 ASR WebSocket 接入被拒绝",
+			"session_id", sessionID, "error_code", realtimeVoiceHandlerErrorCode(err), "error", err)
 		switch {
 		case errors.Is(err, service.ErrRealtimeVoiceUserLimit):
 			fail(c, http.StatusTooManyRequests, CodeConflict, "同一用户已有实时语音流")
@@ -94,9 +96,13 @@ func (s *Server) realtimeVoiceHandler(c *gin.Context) {
 		return
 	}
 	defer reservation.Release()
+	s.log.InfoContext(c.Request.Context(), "实时 ASR WebSocket 接入已校验",
+		"session_id", sessionID)
 
 	conn, err := websocket.Accept(c.Writer, c.Request, &websocket.AcceptOptions{InsecureSkipVerify: true})
 	if err != nil {
+		s.log.WarnContext(c.Request.Context(), "实时 ASR WebSocket 升级失败",
+			"session_id", sessionID, "error", err)
 		return
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "")
@@ -114,12 +120,43 @@ func (s *Server) realtimeVoiceHandler(c *gin.Context) {
 	go stream.keepAlive(runCtx)
 
 	streamID := uuid.NewString()
+	s.log.InfoContext(runCtx, "实时 ASR WebSocket 已连接",
+		"session_id", sessionID, "stream_id", streamID)
 	_, runErr := s.realtimeVoice.RunReserved(runCtx, reservation, sessionID, streamID, stream)
+	if runErr != nil {
+		s.log.WarnContext(runCtx, "实时 ASR WebSocket 会话异常结束",
+			"session_id", sessionID, "stream_id", streamID,
+			"error_code", realtimeVoiceHandlerErrorCode(runErr), "error", runErr)
+	} else {
+		s.log.InfoContext(runCtx, "实时 ASR WebSocket 会话完成",
+			"session_id", sessionID, "stream_id", streamID)
+	}
 	if runErr != nil && stream.canWriteTerminalError() {
 		_ = stream.Write(context.Background(), service.RealtimeVoiceEvent{
 			Type: service.RealtimeVoiceEventError, Code: "upstream_unavailable",
 			Message: "实时语音服务暂时不可用", Retryable: true,
 		})
+	}
+}
+
+func realtimeVoiceHandlerErrorCode(err error) string {
+	switch {
+	case errors.Is(err, service.ErrRealtimeVoiceUserLimit):
+		return "user_limit"
+	case errors.Is(err, service.ErrRealtimeVoiceInstanceLimit):
+		return "instance_limit"
+	case errors.Is(err, service.ErrRealtimeVoiceIdleTimeout):
+		return "idle_timeout"
+	case errors.Is(err, service.ErrRealtimeVoiceFinishTimeout):
+		return "finish_timeout"
+	case errors.Is(err, service.ErrRealtimeVoiceBrowserClosed):
+		return "browser_disconnected"
+	case errors.Is(err, service.ErrRealtimeVoiceDurationLimit):
+		return "duration_limit"
+	case errors.Is(err, service.ErrRealtimeVoiceAudioLimit):
+		return "audio_limit"
+	default:
+		return "realtime_asr_failed"
 	}
 }
 

@@ -10,7 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"healthAgent/internal/service"
+	"KnowledgeMirror/internal/service"
 )
 
 func TestAuthMiddlewareWritesTrustedUserToContext(t *testing.T) {

@@ -7,7 +7,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"healthAgent/internal/service"
+	"KnowledgeMirror/internal/service"
 )
 
 // feynmanPracticeStateResponse 是下发给前端的最小练习状态。

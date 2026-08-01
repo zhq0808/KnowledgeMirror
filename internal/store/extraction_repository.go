@@ -8,7 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"healthAgent/internal/service"
+	"KnowledgeMirror/internal/service"
 )
 
 // LookupSessionUser 按 session_id 返回归属用户；会话不存在或已删除时 found=false。

@@ -10,7 +10,7 @@ import (
 	_ "github.com/golang-migrate/migrate/v4/database/pgx/v5" // 注册 pgx5:// 迁移驱动
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 
-	"healthAgent/internal/config"
+	"KnowledgeMirror/internal/config"
 )
 
 // RunMigrations 用 golang-migrate 把数据库结构拉到最新版本。

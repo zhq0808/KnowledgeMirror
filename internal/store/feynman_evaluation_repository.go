@@ -9,7 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"healthAgent/internal/service"
+	"KnowledgeMirror/internal/service"
 )
 
 const feynmanEvaluationSelectSQL = `

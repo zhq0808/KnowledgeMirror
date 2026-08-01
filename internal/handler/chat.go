@@ -12,8 +12,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"healthAgent/internal/llm"
-	"healthAgent/internal/service"
+	"KnowledgeMirror/internal/llm"
+	"KnowledgeMirror/internal/service"
 )
 
 // chatRequest 是对话接口的请求体。

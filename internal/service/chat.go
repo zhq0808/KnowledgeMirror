@@ -9,7 +9,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"healthAgent/internal/llm"
+	"KnowledgeMirror/internal/llm"
 )
 
 // DefaultMaxReplyChars 是未显式配置时 assistant 单条回复累积的最大字符数上限。

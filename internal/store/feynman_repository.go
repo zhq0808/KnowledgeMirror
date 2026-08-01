@@ -11,7 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"healthAgent/internal/service"
+	"KnowledgeMirror/internal/service"
 )
 
 // PostgresFeynmanRepository 持久化语音费曼练习尝试、录音转写与知识点 Rubric。

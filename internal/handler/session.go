@@ -8,7 +8,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"healthAgent/internal/service"
+	"KnowledgeMirror/internal/service"
 )
 
 var sessionIDPattern = regexp.MustCompile(`^session_[0-9a-f]{32}$`)

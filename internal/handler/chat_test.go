@@ -13,8 +13,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"healthAgent/internal/llm"
-	"healthAgent/internal/service"
+	"KnowledgeMirror/internal/llm"
+	"KnowledgeMirror/internal/service"
 )
 
 type handlerMessageRepository struct {

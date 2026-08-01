@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"healthAgent/internal/stt"
+	"KnowledgeMirror/internal/stt"
 )
 
 // ---------------------------------------------------------------------------

@@ -12,8 +12,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"healthAgent/internal/config"
-	"healthAgent/internal/service"
+	"KnowledgeMirror/internal/config"
+	"KnowledgeMirror/internal/service"
 )
 
 type handlerGuestRecord struct {

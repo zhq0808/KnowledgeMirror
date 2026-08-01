@@ -10,7 +10,7 @@ import (
 	"text/template"
 	"time"
 
-	"healthAgent/internal/llm"
+	"KnowledgeMirror/internal/llm"
 )
 
 const maxExtractionOutputBytes = 128 * 1024

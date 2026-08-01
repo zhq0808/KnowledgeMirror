@@ -10,7 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
-	"healthAgent/internal/service"
+	"KnowledgeMirror/internal/service"
 )
 
 // maxMessageIDAttempts 限制 message_id 生成的有限冲突重试次数。UUIDv7 有 122 位随机，

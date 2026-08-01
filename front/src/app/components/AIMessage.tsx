@@ -13,20 +13,21 @@ interface AIMessageProps {
   // onRetry 复用原 client_message_id 重新发送；仅失败气泡提供。
   onRetry?: () => void;
   retrieval?: RetrievalSources;
+  speechEnabled?: boolean;
 }
 
 // AIMessage 渲染助手回复。回复内容可能包含 markdown（加粗、有序/无序列表、链接等），
 // 用 react-markdown + remark-gfm 渲染，并通过 arbitrary variant 给嵌套元素补样式，
 // 避免额外引入 typography 插件。
 // 当内容为空（回复尚未吐字）时，显示三个主题绿色的跳动圆点作为“正在输入”指示。
-export function AIMessage({ message, time, failed, onRetry, retrieval }: AIMessageProps) {
+export function AIMessage({ message, time, failed, onRetry, retrieval, speechEnabled = false }: AIMessageProps) {
   const isTyping = message.trim().length === 0;
   const speech = useSpeechPlayback();
 
   return (
     <motion.div
-      initial={{ opacity: 0, x: -20 }}
-      animate={{ opacity: 1, x: 0 }}
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
       className="flex flex-col items-start mb-4 px-5"
     >
       <div className="bg-white rounded-2xl rounded-tl-md px-4 py-3 max-w-[80%] shadow-[0_2px_20px_rgba(0,0,0,0.04)]">
@@ -83,22 +84,24 @@ export function AIMessage({ message, time, failed, onRetry, retrieval }: AIMessa
         <div className="mt-1 flex items-center gap-2 pl-1">
           {/* 朗读按钮：把提问真正“说”出来，复现「实时 + 用耳朵听 + 有人等」的面试条件。
               念的是屏幕上这段原文，听到的和看到的永远一致。 */}
-          <button
-            type="button"
-            onClick={() => speech.toggle(message)}
-            disabled={speech.status === "loading"}
-            title={speech.status === "idle" ? "朗读这段" : "停止朗读"}
-            aria-label={speech.status === "idle" ? "朗读这段" : "停止朗读"}
-            className="flex items-center gap-1 rounded-lg text-[11px] text-muted-foreground transition-colors hover:text-primary disabled:opacity-50"
-          >
-            {speech.status === "loading" ? (
-              <LoaderCircle size={12} className="animate-spin" />
-            ) : speech.status === "playing" ? (
-              <Square size={12} className="text-primary" />
-            ) : (
-              <Volume2 size={12} />
-            )}
-          </button>
+          {speechEnabled && (
+            <button
+              type="button"
+              onClick={() => speech.toggle(message)}
+              disabled={speech.status === "loading"}
+              title={speech.status === "idle" ? "朗读这段" : "停止朗读"}
+              aria-label={speech.status === "idle" ? "朗读这段" : "停止朗读"}
+              className="flex size-7 items-center justify-center rounded-lg text-[11px] text-muted-foreground transition-colors hover:text-primary disabled:opacity-50"
+            >
+              {speech.status === "loading" ? (
+                <LoaderCircle size={12} className="animate-spin" />
+              ) : speech.status === "playing" ? (
+                <Square size={12} className="text-primary" />
+              ) : (
+                <Volume2 size={12} />
+              )}
+            </button>
+          )}
           {time && <span className="text-[11px] text-muted-foreground">{time}</span>}
           {speech.error && <span className="text-[11px] text-amber-700">{speech.error}</span>}
         </div>

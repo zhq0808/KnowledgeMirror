@@ -10,7 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
-	"healthAgent/internal/config"
+	"KnowledgeMirror/internal/config"
 )
 
 // pingTimeout 是建连后探活的超时，尽早暴露配置/网络问题，不拖慢启动。

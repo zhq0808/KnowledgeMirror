@@ -10,8 +10,8 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"healthAgent/internal/config"
-	"healthAgent/internal/store"
+	"KnowledgeMirror/internal/config"
+	"KnowledgeMirror/internal/store"
 )
 
 // TestAgentTurnLeaseSchemaEnforcesSingleActiveTurnPerSession 只验证 000008 迁移定义的

@@ -13,14 +13,14 @@ import (
 	"syscall"
 	"time"
 
-	"healthAgent/internal/config"
-	"healthAgent/internal/handler"
-	"healthAgent/internal/llm"
-	"healthAgent/internal/logger"
-	"healthAgent/internal/service"
-	"healthAgent/internal/store"
-	"healthAgent/internal/stt"
-	"healthAgent/internal/tts"
+	"KnowledgeMirror/internal/config"
+	"KnowledgeMirror/internal/handler"
+	"KnowledgeMirror/internal/llm"
+	"KnowledgeMirror/internal/logger"
+	"KnowledgeMirror/internal/service"
+	"KnowledgeMirror/internal/store"
+	"KnowledgeMirror/internal/stt"
+	"KnowledgeMirror/internal/tts"
 )
 
 // migrationsFS 把 migrations/ 下的 SQL 打进二进制，部署时无需额外携带脚本。
@@ -224,71 +224,6 @@ func run() error {
 		log.Info("记忆抽取管道未启用（MEMORY_ENABLED=false）")
 	}
 
-	// 语音费曼练习 v0：录音上传 -> STT 转写 -> 用户确认；未配置 STT API Key 时自动降级为
-	// 本地占位供应商，保证本地开发和没有第三方密钥的环境也能跑通整条链路。
-	var sttProvider stt.Provider
-	switch {
-	case cfg.Feynman.STT.APIKey == "":
-		sttProvider = stt.NewLocalPlaceholderProvider()
-	case cfg.Feynman.STT.Provider == stt.OpenAIWhisperProviderName:
-		sttProvider = stt.NewOpenAIWhisperProvider(
-			cfg.Feynman.STT.APIKey,
-			cfg.Feynman.STT.BaseURL,
-			cfg.Feynman.STT.Model,
-			time.Duration(cfg.Feynman.STT.TimeoutSeconds)*time.Second,
-		)
-	default:
-		// 缺省走 MiMo；配错供应商名时也落到这里，但会先警告。
-		if cfg.Feynman.STT.Provider != stt.MiMoASRProviderName {
-			log.Warn("未知的 STT 供应商名，已回退到 MiMo ASR",
-				"configured", cfg.Feynman.STT.Provider)
-		}
-		sttProvider = stt.NewMiMoASRProvider(
-			cfg.Feynman.STT.APIKey,
-			cfg.Feynman.STT.BaseURL,
-			cfg.Feynman.STT.Model,
-			cfg.Feynman.STT.Language,
-			time.Duration(cfg.Feynman.STT.TimeoutSeconds)*time.Second,
-		)
-	}
-	feynmanService := service.NewFeynmanService(
-		store.NewPostgresFeynmanRepository(db),
-		sttProvider,
-		service.FeynmanLimits{
-			MaxAudioBytes:      cfg.Feynman.MaxAudioBytes,
-			MaxDurationMS:      cfg.Feynman.MaxDurationMS,
-			MaxTranscriptChars: cfg.Feynman.MaxTranscriptChars,
-		},
-		log,
-	)
-	log.Info("语音费曼练习已启用", "stt_provider", feynmanService.STTProviderName())
-	if cfg.Feynman.Evaluation.Enabled && retrievalService != nil {
-		evaluationModel := cfg.Feynman.Evaluation.Model
-		if evaluationModel == "" {
-			evaluationModel = cfg.DeepSeek.Model
-		}
-		evaluationClient := llm.NewDeepSeekClient(
-			cfg.DeepSeek.APIKey,
-			cfg.DeepSeek.BaseURL,
-			evaluationModel,
-			0,
-			time.Duration(cfg.Feynman.Evaluation.TimeoutSeconds)*time.Second,
-		)
-		evaluator, err := service.LoadLLMFeynmanEvaluator(
-			cfg.Feynman.Evaluation.PromptPath,
-			cfg.Feynman.Evaluation.PromptVersion,
-			evaluationModel,
-			evaluationClient,
-		)
-		if err != nil {
-			return err
-		}
-		feynmanService.WithEvaluation(store.NewPostgresFeynmanRepository(db), evaluator, retrievalService)
-		log.Info("费曼证据评估已启用", "prompt_version", cfg.Feynman.Evaluation.PromptVersion, "model", evaluationModel)
-	} else {
-		log.Info("费曼证据评估未启用或可信检索不可用")
-	}
-
 	// 对话式费曼学习：练习是聊天里的一种会话状态，不是独立页面。
 	// 它挂在 ChatService 的最前面，未启用时聊天链路完全不受影响。
 	var feynmanDialogService *service.FeynmanDialogService
@@ -354,7 +289,6 @@ func run() error {
 		}
 		voiceService = service.NewVoiceCaptureService(
 			store.NewPostgresVoiceCaptureRepository(db),
-			sttProvider,
 			glossary,
 			service.VoiceLimits{
 				MaxAudioBytes:      cfg.Voice.MaxAudioBytes,
@@ -366,8 +300,7 @@ func run() error {
 			},
 			log,
 		)
-		log.Info("通用语音输入已启用",
-			"stt_provider", voiceService.STTProviderName(),
+		log.Info("实时语音结果持久化已启用",
 			"glossary_terms", glossary.Size(),
 			"min_confidence", cfg.Voice.MinConfidence)
 	} else {
@@ -444,7 +377,7 @@ func run() error {
 		log.Info("语音合成未启用（SPEECH_ENABLED=false）")
 	}
 
-	srvHandler := handler.NewServer(chatService, identityService, sessionService, messageService, turnLeaseService, documentService, candidateService, retrievalService, feynmanService, feynmanDialogService, voiceService, realtimeVoiceService, speechService, memoryPipeline, cfg.Identity, log).Handler()
+	srvHandler := handler.NewServer(chatService, identityService, sessionService, messageService, turnLeaseService, documentService, candidateService, retrievalService, nil, feynmanDialogService, voiceService, realtimeVoiceService, speechService, memoryPipeline, cfg.Identity, log).Handler()
 	srv := &http.Server{
 		Addr:              ":" + cfg.HTTP.Port,
 		Handler:           srvHandler,

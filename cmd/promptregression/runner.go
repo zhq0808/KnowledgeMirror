@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"time"
 
-	appconfig "healthAgent/internal/config"
-	"healthAgent/internal/llm"
+	appconfig "KnowledgeMirror/internal/config"
+	"KnowledgeMirror/internal/llm"
 )
 
 func executeEvaluation(config evaluationConfig, dataset regressionDataset, cases []regressionCase, clients map[string]completionClient, applicationConfig *appconfig.Config) (report, error) {

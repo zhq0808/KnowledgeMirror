@@ -15,7 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"healthAgent/internal/llm"
+	"KnowledgeMirror/internal/llm"
 )
 
 const (

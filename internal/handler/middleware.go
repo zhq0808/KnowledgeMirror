@@ -11,14 +11,15 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"healthAgent/internal/service"
+	appLogger "KnowledgeMirror/internal/logger"
+	"KnowledgeMirror/internal/service"
 )
 
 // ctxKey 是 context 键类型，避免键冲突。
 type ctxKey string
 
 const (
-	traceIDKey ctxKey = "trace_id"
+	traceIDKey        = appLogger.TraceIDKey
 	userIDKey  ctxKey = "user_id"
 )
 

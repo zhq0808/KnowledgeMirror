@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useLayoutEffect } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { BrainCircuit } from "lucide-react";
 import { StatusTags, StatusTagDef } from "./components/StatusTags";
@@ -39,6 +39,10 @@ import {
   type RetrievalSources,
 } from "./api/chat";
 import { AuthPage } from "./pages/AuthPage";
+import {
+  getApplicationCapabilities,
+  type ApplicationCapabilities,
+} from "./api/capabilities";
 
 interface Message {
   id: string;
@@ -162,6 +166,8 @@ function InterviewWorkspace() {
   const [practiceState, setPracticeState] = useState<FeynmanPracticeState | null>(null);
   const [profileOpen, setProfileOpen] = useState(false);
   const [isSending, setIsSending] = useState(false);
+  const [capabilities, setCapabilities] = useState<ApplicationCapabilities | null>(null);
+  const [inputDockHeight, setInputDockHeight] = useState(176);
   const [selectedModelID, setSelectedModelID] = useState<string>(() =>
     getSelectedModelID()
   );
@@ -220,6 +226,13 @@ function InterviewWorkspace() {
   useEffect(() => {
     let cancelled = false;
     (async () => {
+      try {
+        const available = await getApplicationCapabilities();
+        if (!cancelled) setCapabilities(available);
+      } catch {
+        if (!cancelled) setCapabilities(null);
+      }
+
       const list = await refreshSessions();
       if (cancelled) return;
 
@@ -311,14 +324,9 @@ function InterviewWorkspace() {
 
 
   // Auto-scroll to bottom on new messages
-  useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTo({
-        top: scrollRef.current.scrollHeight,
-        behavior: "smooth",
-      });
-    }
-  }, [messages, pendingConfirmation]);
+  useLayoutEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, [messages, pendingConfirmation, inputDockHeight]);
 
   // Helpers
   const latestMealId = [...messages]
@@ -623,7 +631,10 @@ function InterviewWorkspace() {
 
           <div ref={scrollRef} className="flex-1 overflow-y-auto">
             {!conversationStarted ? (
-              <div className="min-h-full flex flex-col items-center justify-center px-6 pb-48 text-center">
+              <div
+                className="min-h-full flex flex-col items-center justify-center px-6 text-center"
+                style={{ paddingBottom: inputDockHeight + 104 }}
+              >
             <motion.div
               initial={{ opacity: 0, y: 10 }}
               animate={{ opacity: 1, y: 0 }}
@@ -642,7 +653,10 @@ function InterviewWorkspace() {
             </motion.div>
               </div>
             ) : (
-        <div className="flex flex-col pt-2 pb-48">
+        <div
+          className="flex flex-col pt-2"
+          style={{ paddingBottom: inputDockHeight + 104 }}
+        >
           <AnimatePresence>
             {messages.map((message) => {
               switch (message.type) {
@@ -669,6 +683,7 @@ function InterviewWorkspace() {
                       time={resolveTime(message)}
                       failed={message.failed}
                       retrieval={message.retrieval}
+                      speechEnabled={capabilities?.speech === true}
                       onRetry={
                         message.failed
                           ? () => handleRetryMessage(message.id)
@@ -740,9 +755,8 @@ function InterviewWorkspace() {
             }}
             sessionID={activeSessionID}
             onSelectPrompt={handleSelectPracticePrompt}
-            activePrompt={
-              practiceState && practiceState.state !== "idle" ? "费曼学习" : undefined
-            }
+            realtimeVoiceEnabled={capabilities?.realtime_voice === true}
+            voiceCapabilitiesLoaded={capabilities !== null}
             onPhoto={handlePhoto}
             isResponding={isSending}
             onStop={handleStop}
@@ -752,6 +766,7 @@ function InterviewWorkspace() {
               setSelectedModelID(id);
               rememberModelID(id);
             }}
+            onHeightChange={setInputDockHeight}
           />
 
           <SessionDrawer

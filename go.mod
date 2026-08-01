@@ -1,4 +1,4 @@
-module healthAgent
+module KnowledgeMirror
 
 go 1.25.0
 

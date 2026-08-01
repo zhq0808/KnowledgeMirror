@@ -10,7 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"healthAgent/internal/service"
+	"KnowledgeMirror/internal/service"
 )
 
 // uuidPattern 校验路径中的资料/版本/片段 ID，避免把任意字符串送进 SQL 的 UUID 转换。

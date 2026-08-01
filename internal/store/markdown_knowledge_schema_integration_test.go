@@ -9,8 +9,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
-	"healthAgent/internal/config"
-	"healthAgent/internal/store"
+	"KnowledgeMirror/internal/config"
+	"KnowledgeMirror/internal/store"
 )
 
 func TestMarkdownKnowledgeSchemaPreservesOwnershipAndLineage(t *testing.T) {

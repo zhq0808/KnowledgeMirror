@@ -11,7 +11,7 @@ import (
 	"strings"
 	"text/template"
 
-	"healthAgent/internal/llm"
+	"KnowledgeMirror/internal/llm"
 )
 
 // maxCandidateOutputBytes 限制模型输出体积，避免异常长输出拖垮解析与内存。

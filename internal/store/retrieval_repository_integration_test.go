@@ -11,9 +11,9 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"healthAgent/internal/config"
-	"healthAgent/internal/service"
-	"healthAgent/internal/store"
+	"KnowledgeMirror/internal/config"
+	"KnowledgeMirror/internal/service"
+	"KnowledgeMirror/internal/store"
 )
 
 // 固定检索集：用一组稳定语料把「可召回集合」的边界钉死。

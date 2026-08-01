@@ -10,7 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"healthAgent/internal/service"
+	"KnowledgeMirror/internal/service"
 )
 
 // feynmanAudioFormField 是 Push-to-Talk 录音上传的 multipart 字段名。

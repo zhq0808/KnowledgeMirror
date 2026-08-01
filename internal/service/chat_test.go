@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"healthAgent/internal/llm"
+	"KnowledgeMirror/internal/llm"
 )
 
 type fakeChatModel struct {

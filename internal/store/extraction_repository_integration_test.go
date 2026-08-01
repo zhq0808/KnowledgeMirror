@@ -8,7 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"healthAgent/internal/store"
+	"KnowledgeMirror/internal/store"
 )
 
 const (

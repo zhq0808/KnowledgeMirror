@@ -11,7 +11,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"healthAgent/internal/stt"
+	"KnowledgeMirror/internal/stt"
 )
 
 // ---------------------------------------------------------------------------
@@ -511,7 +511,7 @@ func (s *FeynmanService) UploadAudio(ctx context.Context, userID, attemptID stri
 		switch {
 		case text == "":
 			params.Status = FeynmanAudioStatusFailed
-			params.TranscriptError = "STT 返回空转写文本"
+			params.TranscriptError = emptyTranscriptError
 		case utf8.RuneCountInString(text) > s.limits.MaxTranscriptChars:
 			params.Status = FeynmanAudioStatusFailed
 			params.TranscriptError = fmt.Sprintf("STT 转写超过 %d 字上限", s.limits.MaxTranscriptChars)

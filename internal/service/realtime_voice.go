@@ -11,10 +11,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/sync/errgroup"
 
-	"healthAgent/internal/stt"
+	"KnowledgeMirror/internal/stt"
 )
 
 var (
@@ -239,8 +240,13 @@ func (s *RealtimeVoiceService) RunReserved(ctx context.Context, reservation *Rea
 	}
 	defer session.Close()
 	startedAt := time.Now()
+	taskID := session.TaskID()
 	resultCode := "completed"
 	var audioDurationMS int
+	var audioFrames atomic.Int64
+	var audioBytes atomic.Int64
+	var upstreamEvents atomic.Int64
+	var finalEvents atomic.Int64
 	var firstTranscriptLatencyMS atomic.Int64
 	var finishLatencyMS atomic.Int64
 	firstTranscriptLatencyMS.Store(-1)
@@ -248,20 +254,32 @@ func (s *RealtimeVoiceService) RunReserved(ctx context.Context, reservation *Rea
 	defer func() {
 		attributes := []any{
 			"stream_id", streamID,
+			"task_id", taskID,
 			"provider", s.provider.Name(),
 			"model", s.provider.Model(),
 			"result_code", resultCode,
+			"audio_frames", audioFrames.Load(),
+			"audio_bytes", audioBytes.Load(),
 			"audio_duration_ms", audioDurationMS,
+			"upstream_events", upstreamEvents.Load(),
+			"final_events", finalEvents.Load(),
 			"first_transcript_latency_ms", firstTranscriptLatencyMS.Load(),
 			"finish_latency_ms", finishLatencyMS.Load(),
 			"active_streams", s.Metrics().ActiveStreams,
 		}
 		if resultCode == "completed" {
-			s.log.Info("实时语音流结束", attributes...)
+			s.log.InfoContext(ctx, "实时语音流结束", attributes...)
 		} else {
-			s.log.Warn("实时语音流结束", attributes...)
+			s.log.WarnContext(ctx, "实时语音流结束", attributes...)
 		}
 	}()
+	s.log.InfoContext(ctx, "实时 ASR 会话开始",
+		"stream_id", streamID,
+		"task_id", taskID,
+		"provider", s.provider.Name(),
+		"model", s.provider.Model(),
+		"sample_rate", s.limits.SampleRate,
+	)
 
 	startCtx, startCancel := context.WithTimeout(ctx, s.limits.StartTimeout)
 	err := session.Start(startCtx)
@@ -271,6 +289,9 @@ func (s *RealtimeVoiceService) RunReserved(ctx context.Context, reservation *Rea
 		s.metrics.upstreamErrors.Add(1)
 		return VoiceCapture{}, err
 	}
+	s.log.InfoContext(ctx, "实时 ASR 上游任务已就绪",
+		"stream_id", streamID, "task_id", taskID,
+		"start_latency_ms", time.Since(startedAt).Milliseconds())
 	if err := s.writeEvent(ctx, stream, RealtimeVoiceEvent{
 		Type: RealtimeVoiceEventReady, StreamID: streamID, SampleRate: s.limits.SampleRate,
 	}); err != nil {
@@ -290,14 +311,14 @@ func (s *RealtimeVoiceService) RunReserved(ctx context.Context, reservation *Rea
 
 	group.Go(func() error {
 		defer close(audioQueue)
-		return s.readBrowser(groupCtx, stream, audioQueue, &pcm, startedAt, &stopAt)
+		return s.readBrowser(groupCtx, streamID, taskID, stream, audioQueue, &pcm, startedAt, &stopAt, &audioFrames, &audioBytes)
 	})
 	group.Go(func() error {
 		return s.writeUpstream(groupCtx, session, audioQueue)
 	})
 	group.Go(func() error {
 		defer eventQueue.Close()
-		return s.readUpstream(groupCtx, session, eventQueue, aggregator, func() {
+		return s.readUpstream(groupCtx, streamID, taskID, session, eventQueue, aggregator, &upstreamEvents, &finalEvents, func() {
 			firstTranscript.Do(func() {
 				latency := time.Since(startedAt).Milliseconds()
 				firstTranscriptLatencyMS.Store(latency)
@@ -337,7 +358,7 @@ func (s *RealtimeVoiceService) RunReserved(ctx context.Context, reservation *Rea
 	finalizeInput := FinalizeRealtimeInput{
 		UserID: userID, SessionID: sessionID, WAV: wav,
 		Transcript: aggregator.FinalText(), Provider: s.provider.Name(), Model: s.provider.Model(),
-		TaskID: session.TaskID(),
+		TaskID: taskID,
 	}
 	if durationMS > 0 {
 		finalizeInput.DurationMs = &durationMS
@@ -349,11 +370,28 @@ func (s *RealtimeVoiceService) RunReserved(ctx context.Context, reservation *Rea
 			s.metrics.upstreamErrors.Add(1)
 		}
 	}
+	finalText := aggregator.FinalText()
+	finalizeInput.Transcript = finalText
+	s.log.InfoContext(ctx, "实时 ASR 结果聚合完成",
+		"stream_id", streamID, "task_id", taskID,
+		"text_chars", utf8.RuneCountInString(finalText),
+		"sentence_count", finalEvents.Load(),
+		"group_error", groupErr,
+	)
+	s.log.DebugContext(ctx, "实时 ASR 最终聚合文本",
+		"stream_id", streamID, "task_id", taskID, "transcript", finalText)
 	capture, finalizeErr := s.finalizer.FinalizeRealtime(ctx, finalizeInput)
 	if finalizeErr != nil {
 		resultCode = "finalize_failed"
 		return VoiceCapture{}, finalizeErr
 	}
+	s.log.InfoContext(ctx, "实时 ASR 结果已固化",
+		"stream_id", streamID,
+		"task_id", taskID,
+		"capture_id", capture.CaptureID,
+		"capture_status", capture.Status,
+		"transcript_error", capture.TranscriptError,
+	)
 
 	if groupErr != nil {
 		if downstreamErr == nil {
@@ -368,7 +406,7 @@ func (s *RealtimeVoiceService) RunReserved(ctx context.Context, reservation *Rea
 		return capture, groupErr
 	}
 	if capture.Status != VoiceCaptureStatusTranscribed {
-		err := errors.New("实时 STT 返回空最终文本")
+		err := errors.New("实时 ASR 未返回有效转写文本")
 		resultCode = "empty_transcript"
 		if writeErr := s.writeEvent(ctx, stream, RealtimeVoiceEvent{
 			Type: RealtimeVoiceEventError, Code: "empty_transcript", Message: err.Error(), Retryable: true,
@@ -383,7 +421,7 @@ func (s *RealtimeVoiceService) RunReserved(ctx context.Context, reservation *Rea
 	return capture, nil
 }
 
-func (s *RealtimeVoiceService) readBrowser(ctx context.Context, stream RealtimeVoiceStream, audioQueue chan<- []byte, pcm *[]byte, startedAt time.Time, stopAt *atomic.Int64) error {
+func (s *RealtimeVoiceService) readBrowser(ctx context.Context, streamID, taskID string, stream RealtimeVoiceStream, audioQueue chan<- []byte, pcm *[]byte, startedAt time.Time, stopAt, audioFrames, audioBytes *atomic.Int64) error {
 	var acceptedBytes int64
 	for {
 		remaining := s.limits.MaxDuration - time.Since(startedAt)
@@ -418,6 +456,9 @@ func (s *RealtimeVoiceService) readBrowser(ctx context.Context, stream RealtimeV
 		switch input.Type {
 		case RealtimeVoiceInputStop:
 			stopAt.CompareAndSwap(0, time.Now().UnixNano())
+			s.log.InfoContext(ctx, "浏览器结束实时 ASR 输入",
+				"stream_id", streamID, "task_id", taskID,
+				"audio_frames", audioFrames.Load(), "audio_bytes", audioBytes.Load())
 			return nil
 		case RealtimeVoiceInputCancel:
 			return ErrRealtimeVoiceUserCancelled
@@ -429,6 +470,8 @@ func (s *RealtimeVoiceService) readBrowser(ctx context.Context, stream RealtimeV
 				return invalidVoiceInput("PCM 音频帧大小超过上限")
 			}
 			acceptedBytes += int64(len(input.PCM))
+			audioFrames.Add(1)
+			audioBytes.Add(int64(len(input.PCM)))
 			if acceptedBytes > s.limits.MaxAudioBytes-44 {
 				return ErrRealtimeVoiceAudioLimit
 			}
@@ -474,7 +517,7 @@ func (s *RealtimeVoiceService) writeUpstream(ctx context.Context, session stt.Re
 	}
 }
 
-func (s *RealtimeVoiceService) readUpstream(ctx context.Context, session stt.RealtimeSession, queue *realtimeVoiceEventQueue, aggregator *realtimeTranscriptAggregator, observeTranscript func()) error {
+func (s *RealtimeVoiceService) readUpstream(ctx context.Context, streamID, taskID string, session stt.RealtimeSession, queue *realtimeVoiceEventQueue, aggregator *realtimeTranscriptAggregator, upstreamEvents, finalEvents *atomic.Int64, observeTranscript func()) error {
 	var seq int64
 	for {
 		select {
@@ -482,10 +525,25 @@ func (s *RealtimeVoiceService) readUpstream(ctx context.Context, session stt.Rea
 			return ctx.Err()
 		case event, ok := <-session.Events():
 			if !ok {
-				return errors.New("实时 STT 事件流未返回终态")
+				return errors.New("实时 ASR 事件流未返回终态")
 			}
 			switch event.Type {
 			case stt.TranscriptEventResult:
+				upstreamEvents.Add(1)
+				if event.SentenceEnd {
+					finalEvents.Add(1)
+				}
+				s.log.InfoContext(ctx, "收到实时 ASR 识别事件",
+					"stream_id", streamID,
+					"task_id", taskID,
+					"sentence_end", event.SentenceEnd,
+					"begin_time_ms", event.BeginTimeMS,
+					"end_time_ms", event.EndTimeMS,
+					"text_chars", utf8.RuneCountInString(strings.TrimSpace(event.Text)),
+				)
+				s.log.DebugContext(ctx, "实时 ASR 识别事件文本",
+					"stream_id", streamID, "task_id", taskID,
+					"sentence_end", event.SentenceEnd, "transcript", event.Text)
 				sentenceID, accepted := aggregator.Apply(event)
 				if !accepted {
 					continue
@@ -501,8 +559,14 @@ func (s *RealtimeVoiceService) readUpstream(ctx context.Context, session stt.Rea
 					return err
 				}
 			case stt.TranscriptEventFinished:
+				s.log.InfoContext(ctx, "实时 ASR 上游任务结束",
+					"stream_id", streamID, "task_id", taskID,
+					"upstream_events", upstreamEvents.Load(), "final_events", finalEvents.Load())
 				return nil
 			case stt.TranscriptEventFailed:
+				s.log.WarnContext(ctx, "实时 ASR 上游任务失败",
+					"stream_id", streamID, "task_id", taskID,
+					"upstream_code", event.UpstreamCode, "error", event.Err)
 				if event.Err != nil {
 					return event.Err
 				}

@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	appconfig "healthAgent/internal/config"
-	"healthAgent/internal/llm"
+	appconfig "KnowledgeMirror/internal/config"
+	"KnowledgeMirror/internal/llm"
 )
 
 func main() {

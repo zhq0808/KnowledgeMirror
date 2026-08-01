@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"healthAgent/internal/llm"
+	"KnowledgeMirror/internal/llm"
 )
 
 const (

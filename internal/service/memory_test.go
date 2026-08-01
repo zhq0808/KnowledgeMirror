@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"healthAgent/internal/service"
+	"KnowledgeMirror/internal/service"
 )
 
 // fakeMemoryRepository 记录服务层解析后的落库请求，用于在无数据库的情况下断言确定性校验与引用解析。

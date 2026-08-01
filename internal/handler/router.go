@@ -7,8 +7,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"healthAgent/internal/config"
-	"healthAgent/internal/service"
+	"KnowledgeMirror/internal/config"
+	"KnowledgeMirror/internal/service"
 )
 
 // memoryNotifier 抽象“turn 完成后向异步抽取管道投递 session_id”，便于测试注入空实现或省略。
@@ -38,9 +38,9 @@ type Server struct {
 }
 
 // NewServer 构建 HTTP Server 并注册路由与中间件。memory 可为 nil（关闭异步抽取时不投递）；
-// feynman 可为 nil（未配置 STT/知识点时语音费曼练习接口不注册）；
+// feynman 可为 nil（旧版文件录音费曼接口不注册）；
 // practice 可为 nil（未启用对话式费曼学习时不下发练习状态）；
-// voice 可为 nil（未配置 STT 或关闭语音输入时录音接口不注册）；
+// voice 可为 nil（实时语音结果不落库，也不能绑定消息）；
 // realtimeVoice 可为 nil（实时配置不完整时 WebSocket 路由不注册）；
 // speech 可为 nil（未配置 TTS 或关闭语音合成时朗读接口不注册）。
 func NewServer(chat *service.ChatService, identity *service.IdentityService, sessions *service.SessionService, messages *service.MessageService, turnLeases *service.TurnLeaseService, documents *service.DocumentService, candidates *service.CandidateService, retrieval *service.RetrievalService, feynman *service.FeynmanService, practice *service.FeynmanDialogService, voice *service.VoiceCaptureService, realtimeVoice *service.RealtimeVoiceService, speech *service.SpeechService, memory memoryNotifier, identityConfig config.IdentityConfig, log *slog.Logger) *Server {
@@ -91,13 +91,10 @@ func (s *Server) routes() {
 	s.engine.Use(traceMiddleware())
 	s.engine.Use(recoverMiddleware(s.log))
 	s.engine.Use(accessLogMiddleware(s.log))
-	// 全局请求体上限；资料上传和录音上传路径由各自的路由级中间件放宽到更大的上限，
+	// 全局请求体上限；资料上传路径由路由级中间件放宽到更大的上限，
 	// 这里必须跳过它们，否则内层 http.MaxBytesReader 仍会被外层的小上限截断。
 	s.engine.Use(func(c *gin.Context) {
-		if c.Request.Method == http.MethodPost &&
-			(c.Request.URL.Path == "/api/v1/documents" ||
-				c.Request.URL.Path == voiceCapturePath ||
-				isFeynmanAudioUploadPath(c.Request.URL.Path)) {
+		if c.Request.Method == http.MethodPost && c.Request.URL.Path == "/api/v1/documents" {
 			c.Next()
 			return
 		}
@@ -116,6 +113,7 @@ func (s *Server) routes() {
 	// 业务路由。竖切片逐步加入。
 	v1 := s.engine.Group("/api/v1")
 	{
+		v1.GET("/capabilities", s.capabilitiesHandler)
 		v1.POST("/guest", s.guestHandler)
 
 		protected := v1.Group("")
@@ -131,15 +129,6 @@ func (s *Server) routes() {
 			protected.GET("/feynman/practice-state", s.getFeynmanPracticeStateHandler)
 		}
 
-		// 通用语音输入：只负责把录音转成文本，转完仍旧由 /chat/stream 承接，
-		// 文字和语音共用同一套分析流程，这里不存在第二条业务链路。
-		if s.voice != nil {
-			voice := protected.Group("/voice")
-			voice.POST("/captures",
-				bodyLimitMiddleware(feynmanAudioBodyLimitBytes(s.voice.Limits().MaxAudioBytes)),
-				s.createVoiceCaptureHandler)
-			voice.GET("/captures/:capture_id", s.getVoiceCaptureHandler)
-		}
 		if s.realtimeVoice != nil {
 			protected.GET("/voice/realtime", s.realtimeVoiceHandler)
 		}
@@ -191,22 +180,6 @@ func (s *Server) routes() {
 			protected.POST("/retrieval/preview", s.retrievalPreviewHandler)
 		}
 
-		// 语音费曼练习：录音、转写确认、版本化 Rubric、可信来源评估与人工证据决策。
-		if s.feynman != nil {
-			attempts := protected.Group("/feynman/attempts")
-			attempts.POST("", s.createFeynmanAttemptHandler)
-			attempts.GET("/:attempt_id", s.getFeynmanAttemptHandler)
-			attempts.POST("/:attempt_id/audio",
-				bodyLimitMiddleware(feynmanAudioBodyLimitBytes(s.feynman.Limits().MaxAudioBytes)),
-				s.uploadFeynmanAudioHandler)
-			attempts.POST("/:attempt_id/confirm", s.confirmFeynmanTranscriptHandler)
-			attempts.POST("/:attempt_id/evaluate", s.evaluateFeynmanAttemptHandler)
-			attempts.GET("/:attempt_id/evaluation", s.getFeynmanEvaluationHandler)
-			protected.POST("/feynman/evaluations/:evaluation_id/decision", s.decideFeynmanEvaluationHandler)
-
-			protected.GET("/knowledge-points/:knowledge_point_id/rubric", s.getFeynmanRubricHandler)
-			protected.POST("/knowledge-points/:knowledge_point_id/rubric/versions", s.createFeynmanRubricVersionHandler)
-		}
 	}
 }
 

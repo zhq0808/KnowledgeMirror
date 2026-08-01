@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"healthAgent/internal/llm"
+	"KnowledgeMirror/internal/llm"
 )
 
 type memoryExtractionModelStub struct {

@@ -62,27 +62,8 @@ retrieval:
   max_chunk_chars: 1200           # 单个片段进入 Prompt 的字符上限，超出显式标注截断
   context_budget_chars: 4000      # 检索上下文总预算
 
-# 语音费曼练习 v0：录音上传 -> STT 转写 -> 用户确认；以及知识点版本化 Rubric。
-# 音频上限均为防御性预算；确认转写和 Rubric 本身都不产生掌握状态或证据。
+# 对话式费曼学习：同一个聊天框里的“提问 -> 回答 -> 分析 -> 追问”。
 feynman:
-  max_audio_bytes: 6291456        # 6 MiB
-  max_duration_ms: 180000         # 3 分钟
-  max_transcript_chars: 8000
-  stt:
-    provider: "mimo_asr"                    # mimo_asr | openai_whisper；两家协议不兼容，不能只改 base_url
-    base_url: "https://api.xiaomimimo.com/v1"
-    model: "mimo-v2.5-asr"
-    language: "zh"                          # auto | zh | en；明确语种识别更准
-    timeout_seconds: 60
-    # ⚠ mimo_asr 仅接受 wav / mp3，Base64 后不超 10 MB；浏览器默认的 webm/opus 必须先转成 wav。
-    # api_key 走 .env 的 FEYNMAN_STT_API_KEY；未配置时自动降级为 local_placeholder，服务正常启动。
-  evaluation:
-    enabled: true
-    model: "deepseek/deepseek-v4-flash"
-    prompt_version: "feynman-evaluator-v1"
-    prompt_path: "prompts/feynman_evaluator_v1.tmpl"
-    timeout_seconds: 60
-  # 对话式费曼学习：同一个聊天框里的“提问 -> 回答 -> 分析 -> 追问”，不切页面、不填表单。
   dialog:
     enabled: true
     model: "deepseek/deepseek-v4-flash"
@@ -97,10 +78,9 @@ feynman:
     max_context_turns: 6           # 进入分析的最近对话轮数
     max_answer_runes: 6000         # 进入分析的回答长度上限
 
-# 通用语音输入：普通对话输入区的 Push-to-Talk。
+# 通用语音输入：普通对话输入区的实时 ASR。
 # 语音只负责把这句话变成文字，之后走的是和打字完全相同的一条链路，
 # 因此这里没有任何分析参数，也不会产生掌握状态。
-# STT 供应商复用 feynman.stt.*，不在这里重复配置。
 voice:
   enabled: true
   max_audio_bytes: 6291456        # 6 MiB

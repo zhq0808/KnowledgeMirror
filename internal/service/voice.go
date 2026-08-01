@@ -9,23 +9,19 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
-
-	"healthAgent/internal/stt"
 )
 
 // ---------------------------------------------------------------------------
-// 通用语音输入 v0：Push-to-Talk -> STT 转写 -> 决定是否需要用户确认。
+// 实时语音输入持久化：固化实时 ASR 的最终文本，并关联最终聊天消息。
 //
 // 这里刻意只做「把声音变成文本」这一件事。转写完成后，这段文本走的是和打字
 // 完全相同的一条链路（/chat/stream -> 费曼对话服务），所以本文件里不存在任何
 // 费曼分析逻辑，也不产生任何掌握状态或掌握证据 —— 说了话不等于讲对了。
 //
-// 与费曼练习里那套语音（FeynmanService.UploadAudio）的区别：那套绑在练习尝试上，
-// 是「一次正式作答」；这套绑在会话上，是「输入法」。两者共用同一个 stt.Provider 实例。
+// 这套记录绑在聊天会话上，是实时语音输入的审计记录，不是独立练习任务。
 // ---------------------------------------------------------------------------
 
-// 录音任务状态。v0 同步调用 STT，返回时已是 transcribed/failed 终态；
-// uploaded/transcribing 是过程态，只有崩溃时才会留在库里，由过期接管兜底。
+// 实时 ASR 在会话结束时固化 transcribed/failed 终态；transcribing 仅是短暂落库过程态。
 const (
 	VoiceCaptureStatusUploaded     = "uploaded"
 	VoiceCaptureStatusTranscribing = "transcribing"
@@ -41,6 +37,8 @@ const (
 	VoiceConfirmReasonLowConfidence     = "low_confidence"
 	VoiceConfirmReasonAmbiguousTerms    = "ambiguous_terms"
 )
+
+const emptyTranscriptError = "没有听到可转写内容，请重新录音"
 
 // ErrVoiceCaptureNotFound 表示录音记录不存在或不属于当前用户/会话。
 var ErrVoiceCaptureNotFound = errors.New("语音记录不存在")
@@ -149,18 +147,16 @@ type VoiceLimits struct {
 	TranscribingStale time.Duration
 }
 
-// VoiceCaptureService 实现通用语音输入 v0。
+// VoiceCaptureService 固化实时 ASR 结果并维护语音记录与消息的关联。
 type VoiceCaptureService struct {
 	repo     VoiceCaptureRepository
-	stt      stt.Provider
 	glossary *TermGlossary
 	limits   VoiceLimits
 	log      *slog.Logger
 }
 
-// NewVoiceCaptureService 构造语音输入服务。glossary 为 nil 时关闭术语歧义检测，
-// 其余判定（转写失败/置信度）不受影响。
-func NewVoiceCaptureService(repo VoiceCaptureRepository, sttProvider stt.Provider, glossary *TermGlossary, limits VoiceLimits, log *slog.Logger) *VoiceCaptureService {
+// NewVoiceCaptureService 构造实时语音结果持久化服务。glossary 为 nil 时关闭术语歧义检测。
+func NewVoiceCaptureService(repo VoiceCaptureRepository, glossary *TermGlossary, limits VoiceLimits, log *slog.Logger) *VoiceCaptureService {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -170,76 +166,14 @@ func NewVoiceCaptureService(repo VoiceCaptureRepository, sttProvider stt.Provide
 	if limits.MaxAmbiguousTerms <= 0 {
 		limits.MaxAmbiguousTerms = 5
 	}
-	return &VoiceCaptureService{repo: repo, stt: sttProvider, glossary: glossary, limits: limits, log: log}
+	return &VoiceCaptureService{repo: repo, glossary: glossary, limits: limits, log: log}
 }
 
 // Limits 返回当前生效的预算配置，供接口层提前校验请求体大小。
 func (s *VoiceCaptureService) Limits() VoiceLimits { return s.limits }
 
-// STTProviderName 返回当前 STT 供应商标识，供启动日志确认实际生效的供应商。
-func (s *VoiceCaptureService) STTProviderName() string { return s.stt.Name() }
-
-// Capture 接收一段录音并同步完成转写。
-//
-// v0 决策：同步调用 STT，不进异步队列 —— 录音有硬上限，单次转写耗时可控，
-// 而「说完立刻看到文字」是这个功能的全部价值，异步化反而把体验做没了。
-//
-// 无论转写成功还是失败，本方法都返回一条 VoiceCapture 而不是错误：
-// 失败也是一次真实发生过的录音，前端据此提示「转写失败，请改用打字」，
-// 不该让用户以为自己刚才那段话凭空消失了。只有输入不合法或存储故障才返回错误。
-func (s *VoiceCaptureService) Capture(ctx context.Context, userID, sessionID string, audio []byte, mimeType string, durationMs *int) (VoiceCapture, error) {
-	userID, sessionID, err := s.validateInput(userID, sessionID, audio, mimeType, durationMs)
-	if err != nil {
-		return VoiceCapture{}, err
-	}
-	claimed, won, err := s.claim(ctx, userID, sessionID, audio, mimeType, durationMs, s.stt.Name())
-	if err != nil {
-		return VoiceCapture{}, err
-	}
-	if !won {
-		s.log.Info("命中已有语音记录，跳过重复 STT 调用",
-			"session_id", sessionID, "capture_id", claimed.CaptureID)
-		return claimed, nil
-	}
-
-	params := CompleteVoiceCaptureParams{
-		CaptureID:   claimed.CaptureID,
-		UserID:      userID,
-		STTProvider: s.stt.Name(),
-	}
-	transcript, sttErr := s.stt.Transcribe(ctx, audio, mimeType)
-	switch {
-	case sttErr != nil:
-		// 只记供应商和错误，不记转写文本：这是用户说的话，日志不是它该待的地方。
-		s.log.Warn("语音转写失败", "session_id", sessionID, "capture_id", claimed.CaptureID,
-			"provider", s.stt.Name(), "error", sttErr)
-		params.Status = VoiceCaptureStatusFailed
-		params.TranscriptError = truncateFeynmanError(sttErr.Error(), 2000)
-	default:
-		text := strings.TrimSpace(transcript.Text)
-		switch {
-		case text == "":
-			params.Status = VoiceCaptureStatusFailed
-			params.TranscriptError = "STT 返回空转写文本"
-		case utf8.RuneCountInString(text) > s.limits.MaxTranscriptChars:
-			params.Status = VoiceCaptureStatusFailed
-			params.TranscriptError = fmt.Sprintf("STT 转写超过 %d 字上限", s.limits.MaxTranscriptChars)
-		default:
-			params.Status = VoiceCaptureStatusTranscribed
-			params.RawTranscript = text
-			params.STTProvider = transcript.Provider
-			params.STTModel = transcript.Model
-			params.STTRequestID = transcript.RequestID
-			params.Confidence = transcript.Confidence
-			params.AmbiguousTerms = s.glossary.AmbiguousTerms(text, s.limits.MaxAmbiguousTerms)
-		}
-	}
-	params.NeedsConfirmation, params.ConfirmationReason = s.judgeConfirmation(params)
-	return s.complete(ctx, params)
-}
-
 // FinalizeRealtime 将实时供应商已经生成的最终文本和完整 WAV 一次性固化。
-// 它刻意不调用 stt.Provider.Transcribe，避免同一段音频产生第二份文本和重复费用。
+// 它不会再次调用文件式 ASR，避免同一段音频产生第二份文本和重复费用。
 func (s *VoiceCaptureService) FinalizeRealtime(ctx context.Context, input FinalizeRealtimeInput) (VoiceCapture, error) {
 	const mimeType = "audio/wav"
 	userID, sessionID, err := s.validateInput(input.UserID, input.SessionID, input.WAV, mimeType, input.DurationMs)
@@ -278,7 +212,7 @@ func (s *VoiceCaptureService) FinalizeRealtime(ctx context.Context, input Finali
 		params.TranscriptError = truncateFeynmanError(transcriptError, 2000)
 	case text == "":
 		params.Status = VoiceCaptureStatusFailed
-		params.TranscriptError = "STT 返回空转写文本"
+		params.TranscriptError = emptyTranscriptError
 	case utf8.RuneCountInString(text) > s.limits.MaxTranscriptChars:
 		params.Status = VoiceCaptureStatusFailed
 		params.TranscriptError = fmt.Sprintf("STT 转写超过 %d 字上限", s.limits.MaxTranscriptChars)
@@ -333,13 +267,6 @@ func (s *VoiceCaptureService) claim(ctx context.Context, userID, sessionID strin
 		STTProvider: provider,
 		StaleBefore: time.Now().Add(-s.limits.TranscribingStale),
 	})
-}
-
-func (s *VoiceCaptureService) complete(ctx context.Context, params CompleteVoiceCaptureParams) (VoiceCapture, error) {
-	// 转写已经花掉了真金白银，落库不能因为用户关掉页面（ctx 被取消）就丢掉。
-	completeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
-	defer cancel()
-	return s.repo.Complete(completeCtx, params)
 }
 
 // judgeConfirmation 裁决本次是否需要用户确认后再发送，并给出唯一原因。

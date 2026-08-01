@@ -17,36 +17,36 @@ interface InputDockProps {
   onSendMessage: (message: string, voiceCaptureID?: string) => void;
   sessionID: string | null;
   onSelectPrompt: (prompt: { emoji: string; label: string }) => void;
-  activePrompt?: string;
-  voiceDisabled?: boolean;
-  // voiceTitle 覆盖麦克风按钮的提示文案，用于说明按钮为什么不可用。
-  voiceTitle?: string;
+  realtimeVoiceEnabled?: boolean;
+  voiceCapabilitiesLoaded?: boolean;
   onPhoto: (file: File) => void;
   isResponding: boolean;
   onStop: () => void;
   models: ModelOption[];
   selectedModelID: string;
   onSelectModel: (modelID: string) => void;
+  onHeightChange?: (height: number) => void;
 }
 
 export function InputDock({
   onSendMessage,
   sessionID,
   onSelectPrompt,
-  activePrompt,
-  voiceDisabled = false,
-  voiceTitle,
+  realtimeVoiceEnabled = false,
+  voiceCapabilitiesLoaded = false,
   onPhoto,
   isResponding,
   onStop,
   models,
   selectedModelID,
   onSelectModel,
+  onHeightChange,
 }: InputDockProps) {
   const [input, setInput] = useState("");
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textInputRef = useRef<HTMLInputElement>(null);
+  const dockRef = useRef<HTMLDivElement>(null);
   const realtime = useRealtimeTranscription();
   const voiceBusy =
     realtime.status === "connecting" ||
@@ -62,6 +62,17 @@ export function InputDock({
     realtime.reset("");
     setInput("");
   }, [sessionID, realtime.reset]);
+
+  useEffect(() => {
+    const dock = dockRef.current;
+    if (!dock || !onHeightChange) return;
+
+    const reportHeight = () => onHeightChange(Math.ceil(dock.getBoundingClientRect().height));
+    reportHeight();
+    const observer = new ResizeObserver(reportHeight);
+    observer.observe(dock);
+    return () => observer.disconnect();
+  }, [onHeightChange]);
 
   const selectedModel =
     models.find((m) => m.id === selectedModelID) ?? models[0];
@@ -94,7 +105,7 @@ export function InputDock({
   };
 
   const startRealtime = () => {
-    if (!sessionID || voiceDisabled || voiceBusy) return;
+    if (!sessionID || !realtimeVoiceEnabled || voiceBusy) return;
     realtime.start(sessionID, input);
   };
 
@@ -107,16 +118,19 @@ export function InputDock({
     realtime.status === "connecting" ||
     realtime.status === "ready" ||
     realtime.status === "streaming";
-  const micDisabled = voiceDisabled || !sessionID || realtime.status === "stopping";
+  const micDisabled = !voiceCapabilitiesLoaded || !realtimeVoiceEnabled || !sessionID || realtime.status === "stopping";
   const micTitle =
-    voiceTitle ??
-    (canStopRealtime
+    canStopRealtime
       ? "停止听写"
       : realtime.status === "stopping"
         ? "正在收尾"
         : realtime.status === "review"
           ? "重新听写"
-          : "实时语音输入");
+          : !voiceCapabilitiesLoaded
+            ? "正在确认实时 ASR 服务"
+            : !realtimeVoiceEnabled
+              ? "实时 ASR 服务未配置"
+              : "实时语音输入";
 
   const voiceStatusText = (() => {
     switch (realtime.status) {
@@ -138,7 +152,7 @@ export function InputDock({
   })();
 
   return (
-    <div className="absolute bottom-[80px] left-0 right-0 z-30 bg-gradient-to-t from-[#F6F8F4] via-[#F6F8F4]/96 to-transparent px-5 pb-4 pt-8">
+    <div ref={dockRef} className="absolute bottom-[80px] left-0 right-0 z-30 bg-gradient-to-t from-[#F6F8F4] via-[#F6F8F4]/96 to-transparent px-5 pb-4 pt-8">
       {/* 快捷提示行；模型选择器放在同一行最左侧（在滚动容器之外，避免向上弹出的菜单被裁剪）。 */}
       <div className="flex items-center gap-2 mb-3">
         {/* 模型选择。当前仅前端选择与本地记忆，后端支持后再随请求下发。 */}
@@ -203,12 +217,7 @@ export function InputDock({
               key={p.label}
               type="button"
               onClick={() => onSelectPrompt(p)}
-              aria-pressed={activePrompt === p.label}
-              className={`flex-shrink-0 flex items-center gap-1.5 rounded-full px-3.5 py-2 text-xs shadow-[0_2px_12px_rgba(0,0,0,0.05)] transition-colors ${
-                activePrompt === p.label
-                  ? "bg-primary text-primary-foreground"
-                  : "bg-white text-gray-600 hover:bg-gray-50"
-              }`}
+              className="flex-shrink-0 flex items-center gap-1.5 rounded-full bg-white px-3.5 py-2 text-xs text-gray-600 shadow-[0_2px_12px_rgba(0,0,0,0.05)] transition-colors hover:bg-gray-50 active:bg-gray-100"
             >
               <span>{p.emoji}</span>
               <span>{p.label}</span>
@@ -243,7 +252,9 @@ export function InputDock({
             {realtime.status === "failed" && (
               <button
                 type="button"
-                onClick={() => realtime.reset(input)}
+                onClick={() => {
+                  realtime.reset(input);
+                }}
                 aria-label="关闭提示"
                 className="flex-shrink-0 text-gray-400 hover:text-gray-600"
               >

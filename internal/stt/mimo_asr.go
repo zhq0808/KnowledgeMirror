@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // MiMoASRProviderName 是小米 MiMo 语音识别供应商的标识。
@@ -99,6 +101,9 @@ func (p *MiMoASRProvider) Transcribe(ctx context.Context, audio []byte, mimeType
 	if !ok {
 		return Transcript{}, fmt.Errorf("%w: %q（MiMo ASR 仅支持 wav 与 mp3）", ErrUnsupportedAudioFormat, mimeType)
 	}
+	if normalizedMIME == "audio/wav" && isDigitalSilencePCM16WAV(audio) {
+		return Transcript{}, nil
+	}
 
 	dataURL := "data:" + normalizedMIME + ";base64," + base64.StdEncoding.EncodeToString(audio)
 	payload := mimoASRRequest{
@@ -162,7 +167,7 @@ func (p *MiMoASRProvider) Transcribe(ctx context.Context, audio []byte, mimeType
 	}
 
 	return Transcript{
-		Text:      strings.TrimSpace(parsed.Choices[0].Message.Content),
+		Text:      normalizeMiMoASRText(parsed.Choices[0].Message.Content),
 		Provider:  MiMoASRProviderName,
 		Model:     p.model,
 		RequestID: requestID,
@@ -171,6 +176,72 @@ func (p *MiMoASRProvider) Transcribe(ctx context.Context, audio []byte, mimeType
 		// 也就是每次都要用户确认一遍——对面试练习场景来说，宁可多确认也不能塞错话。
 		Confidence: nil,
 	}, nil
+}
+
+func normalizeMiMoASRText(text string) string {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return ""
+	}
+
+	compact := strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return -1
+		}
+		return r
+	}, trimmed)
+	markers := [...]string{"<think>", "think>", "</think>", "<chinese>", "chinese>", "</chinese>"}
+	for compact != "" {
+		matched := false
+		for _, marker := range markers {
+			if strings.HasPrefix(compact, marker) {
+				compact = strings.TrimPrefix(compact, marker)
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return trimmed
+		}
+	}
+
+	return ""
+}
+
+func isDigitalSilencePCM16WAV(audio []byte) bool {
+	if len(audio) < 12 || string(audio[0:4]) != "RIFF" || string(audio[8:12]) != "WAVE" {
+		return false
+	}
+
+	pcm16 := false
+	var samples []byte
+	for offset := 12; offset+8 <= len(audio); {
+		chunkSize := int(binary.LittleEndian.Uint32(audio[offset+4 : offset+8]))
+		dataStart := offset + 8
+		if chunkSize < 0 || dataStart > len(audio) || chunkSize > len(audio)-dataStart {
+			return false
+		}
+		chunk := audio[dataStart : dataStart+chunkSize]
+		switch string(audio[offset : offset+4]) {
+		case "fmt ":
+			if len(chunk) >= 16 {
+				pcm16 = binary.LittleEndian.Uint16(chunk[0:2]) == 1 &&
+					binary.LittleEndian.Uint16(chunk[14:16]) == 16
+			}
+		case "data":
+			samples = chunk
+		}
+		offset = dataStart + chunkSize + chunkSize%2
+	}
+	if !pcm16 || len(samples) < 2 || len(samples)%2 != 0 {
+		return false
+	}
+	for offset := 0; offset < len(samples); offset += 2 {
+		if binary.LittleEndian.Uint16(samples[offset:offset+2]) != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 type mimoASRRequest struct {

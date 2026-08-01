@@ -15,9 +15,9 @@ import (
 	"github.com/coder/websocket"
 	"github.com/google/uuid"
 
-	"healthAgent/internal/config"
-	"healthAgent/internal/service"
-	"healthAgent/internal/stt"
+	"KnowledgeMirror/internal/config"
+	"KnowledgeMirror/internal/service"
+	"KnowledgeMirror/internal/stt"
 )
 
 const realtimeTestCookieName = "interview_guest_realtime_test"

@@ -9,9 +9,9 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"healthAgent/internal/config"
-	"healthAgent/internal/service"
-	"healthAgent/internal/store"
+	"KnowledgeMirror/internal/config"
+	"KnowledgeMirror/internal/service"
+	"KnowledgeMirror/internal/store"
 )
 
 func TestPostgresFeynmanPracticeRepositoryLifecycle(t *testing.T) {

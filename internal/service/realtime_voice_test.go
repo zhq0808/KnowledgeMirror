@@ -11,7 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"healthAgent/internal/stt"
+	appLogger "KnowledgeMirror/internal/logger"
+	"KnowledgeMirror/internal/stt"
 )
 
 type fakeRealtimeProvider struct{ session *fakeRealtimeSession }
@@ -30,6 +31,7 @@ type fakeRealtimeSession struct {
 	send      func(context.Context, []byte) error
 	finish    func(context.Context, *fakeRealtimeSession) error
 	closeCall int
+	terminal  sync.Once
 }
 
 func newFakeRealtimeSession() *fakeRealtimeSession {
@@ -57,9 +59,15 @@ func (s *fakeRealtimeSession) Finish(ctx context.Context) error {
 	if s.finish != nil {
 		return s.finish(ctx, s)
 	}
-	s.events <- stt.TranscriptEvent{Type: stt.TranscriptEventFinished, TaskID: s.taskID}
-	close(s.events)
+	s.terminate(stt.TranscriptEvent{Type: stt.TranscriptEventFinished, TaskID: s.taskID})
 	return nil
+}
+
+func (s *fakeRealtimeSession) terminate(event stt.TranscriptEvent) {
+	s.terminal.Do(func() {
+		s.events <- event
+		close(s.events)
+	})
 }
 func (s *fakeRealtimeSession) Close() error {
 	s.mu.Lock()
@@ -151,7 +159,7 @@ func testRealtimeLimits() RealtimeVoiceLimits {
 }
 
 func TestRealtimeVoiceNormalStopDrainsAudioAndIncludesFinishFinal(t *testing.T) {
-	voice, _ := newTestVoiceService(t, &voiceSTTStub{text: "file STT must not run"})
+	voice, _ := newTestVoiceService(t)
 	session := newFakeRealtimeSession()
 	session.events <- stt.TranscriptEvent{Type: stt.TranscriptEventResult, Text: "第一句过程", BeginTimeMS: 0}
 	session.events <- stt.TranscriptEvent{Type: stt.TranscriptEventResult, Text: "第一句。", SentenceEnd: true, BeginTimeMS: 0}
@@ -163,8 +171,7 @@ func TestRealtimeVoiceNormalStopDrainsAudioAndIncludesFinishFinal(t *testing.T) 
 			t.Errorf("Finish() 前 SendAudio 次数 = %d, want 2", sentCount)
 		}
 		session.events <- stt.TranscriptEvent{Type: stt.TranscriptEventResult, Text: "最后半句。", SentenceEnd: true, BeginTimeMS: 1000}
-		session.events <- stt.TranscriptEvent{Type: stt.TranscriptEventFinished, TaskID: session.taskID}
-		close(session.events)
+		session.terminate(stt.TranscriptEvent{Type: stt.TranscriptEventFinished, TaskID: session.taskID})
 		return nil
 	}
 	service := NewRealtimeVoiceService(&fakeRealtimeProvider{session: session}, voice, RealtimeVoiceLimits{
@@ -249,6 +256,61 @@ func TestRealtimeVoiceMetricsAndLogsExcludeSensitivePayloads(t *testing.T) {
 	}
 }
 
+func TestRealtimeVoiceDebugLogsIncludeProviderTranscript(t *testing.T) {
+	session := newFakeRealtimeSession()
+	session.events <- stt.TranscriptEvent{
+		Type: stt.TranscriptEventResult, Text: "用于定位混合语种的上游原文", SentenceEnd: true,
+	}
+	stream := newFakeRealtimeStream(
+		RealtimeVoiceInput{Type: RealtimeVoiceInputAudio, PCM: make([]byte, 3200)},
+		RealtimeVoiceInput{Type: RealtimeVoiceInputStop},
+	)
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	limits := testRealtimeLimits()
+	limits.MaxAudioBytes = 4096
+	service := NewRealtimeVoiceService(&fakeRealtimeProvider{session: session}, &recordingRealtimeFinalizer{}, limits, logger)
+
+	if _, err := service.Run(context.Background(), "usr_1", "session_1", "stream_debug", stream); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	logText := logs.String()
+	if !strings.Contains(logText, "实时 ASR 识别事件文本") ||
+		!strings.Contains(logText, "用于定位混合语种的上游原文") {
+		t.Fatalf("debug log missing upstream transcript: %s", logText)
+	}
+}
+
+func TestRealtimeVoiceLogsInheritTraceID(t *testing.T) {
+	session := newFakeRealtimeSession()
+	session.events <- stt.TranscriptEvent{
+		Type: stt.TranscriptEventResult, Text: "trace test", SentenceEnd: true,
+	}
+	stream := newFakeRealtimeStream(
+		RealtimeVoiceInput{Type: RealtimeVoiceInputAudio, PCM: make([]byte, 3200)},
+		RealtimeVoiceInput{Type: RealtimeVoiceInputStop},
+	)
+	var logs bytes.Buffer
+	log := slog.New(&appLogger.ContextHandler{
+		Handler: slog.NewJSONHandler(&logs, nil),
+	})
+	limits := testRealtimeLimits()
+	limits.MaxAudioBytes = 4096
+	service := NewRealtimeVoiceService(&fakeRealtimeProvider{session: session}, &recordingRealtimeFinalizer{}, limits, log)
+	ctx := context.WithValue(context.Background(), appLogger.TraceIDKey, "trace-realtime-123")
+
+	if _, err := service.Run(ctx, "usr_1", "session_1", "stream_trace", stream); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	logText := logs.String()
+	if !strings.Contains(logText, `"trace_id":"trace-realtime-123"`) {
+		t.Fatalf("realtime ASR logs missing inherited trace_id: %s", logText)
+	}
+	if count := strings.Count(logText, `"trace_id":"trace-realtime-123"`); count < 6 {
+		t.Fatalf("trace_id should cover the realtime lifecycle, got %d records: %s", count, logText)
+	}
+}
+
 func TestRealtimeVoiceFailurePathsFinalizeAndReleaseQuota(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -259,8 +321,7 @@ func TestRealtimeVoiceFailurePathsFinalizeAndReleaseQuota(t *testing.T) {
 		{
 			name: "upstream failed",
 			configure: func(session *fakeRealtimeSession, _ *fakeRealtimeStream, _ *RealtimeVoiceLimits) {
-				session.events <- stt.TranscriptEvent{Type: stt.TranscriptEventFailed, Err: stt.ErrRealtimeUpstream}
-				close(session.events)
+				session.terminate(stt.TranscriptEvent{Type: stt.TranscriptEventFailed, Err: stt.ErrRealtimeUpstream})
 			},
 			wantErr: stt.ErrRealtimeUpstream, wantAudit: "upstream_failed",
 		},
