@@ -61,34 +61,6 @@ export interface RetrievalSources {
 
 const sessionIDKey = "interview_agent_session_id_v1";
 
-// ModelOption 是可选的对话模型。目前后端使用配置里的单一模型，模型选择仅前端展示与本地记忆；
-// TODO(后端): 支持 per-request model 后，把 selectedModel 随 chat 请求下发并按归属校验。
-export interface ModelOption {
-  id: string;
-  name: string;
-  desc: string;
-}
-
-export const MODELS: ModelOption[] = [
-  { id: "deepseek-chat", name: "标准", desc: "日常对话，响应更快" },
-  { id: "deepseek-reasoner", name: "深度思考", desc: "复杂问题，推理更强" },
-];
-
-export const DEFAULT_MODEL_ID = "deepseek-chat";
-const modelIDKey = "interview_agent_model_id";
-
-// getSelectedModelID 读取本地记住的模型；非法或缺省时回退默认模型。
-export function getSelectedModelID(): string {
-  const stored = localStorage.getItem(modelIDKey);
-  if (stored && MODELS.some((m) => m.id === stored)) return stored;
-  return DEFAULT_MODEL_ID;
-}
-
-// rememberModelID 记住当前选择的模型。
-export function rememberModelID(id: string): void {
-  localStorage.setItem(modelIDKey, id);
-}
-
 // createOrResumeGuest 始终请求后端：有效 HttpOnly Cookie 会恢复原 Guest，
 // 没有有效凭证时才原子创建新用户。user_id 仅用于响应诊断，不在前端持久化或授权。
 export async function createOrResumeGuest(): Promise<GuestResponse> {

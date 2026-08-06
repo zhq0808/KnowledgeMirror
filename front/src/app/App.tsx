@@ -2,15 +2,9 @@ import { useState, useRef, useEffect, useLayoutEffect } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { BrainCircuit } from "lucide-react";
 import { StatusTags, StatusTagDef } from "./components/StatusTags";
-import { MealSuggestionCard } from "./components/MealSuggestionCard";
-import { ActionCard } from "./components/ActionCard";
-import { WarningCard } from "./components/WarningCard";
-import { ConfirmationCard } from "./components/ConfirmationCard";
-import { MorningGreetingCard } from "./components/MorningGreetingCard";
 import { InputDock } from "./components/InputDock";
 import { UserMessage } from "./components/UserMessage";
 import { AIMessage } from "./components/AIMessage";
-import { MealCard } from "./components/MealCard";
 import { AppHeader } from "./components/AppHeader";
 import { SessionDrawer } from "./components/SessionDrawer";
 import { Dashboard } from "./components/Dashboard";
@@ -31,9 +25,6 @@ import {
   createNewSession,
   getActiveSessionID,
   rememberSessionID,
-  MODELS,
-  getSelectedModelID,
-  rememberModelID,
   type SessionListItem,
   type SessionMessage,
   type RetrievalSources,
@@ -46,16 +37,8 @@ import {
 
 interface Message {
   id: string;
-  type:
-    | "user"
-    | "ai"
-    | "meal-card"
-    | "meal-suggestion"
-    | "action-card"
-    | "warning"
-    | "confirmation"
-    | "morning-greeting";
-  content: any;
+  type: "user" | "ai";
+  content: string;
   // time 为气泡下方展示的时间(HH:MM)。历史消息用后端 created_at；实时消息渲染时按需生成。
   time?: string;
   // failed 标记该助手气泡对应的发送失败，需展示重试入口。
@@ -65,18 +48,6 @@ interface Message {
   retry?: { clientMessageID: string; text: string; voiceCaptureID?: string };
   retrieval?: RetrievalSources;
 }
-
-interface ActionItem {
-  id: string;
-  text: string;
-  completed: boolean;
-}
-
-const initialActions: ActionItem[] = [
-  { id: "1", text: "餐前测血糖", completed: true },
-  { id: "2", text: "饮用 500ml 温水", completed: false },
-  { id: "3", text: "完成 20 分钟散步", completed: false },
-];
 
 const INITIAL_TAGS: StatusTagDef[] = [
   {
@@ -143,8 +114,7 @@ function mapBackendMessages(items: SessionMessage[]): Message[] {
 }
 
 function InterviewWorkspace() {
-  const [tags, setTags] = useState<StatusTagDef[]>(INITIAL_TAGS);
-  const [actions, setActions] = useState<ActionItem[]>(initialActions);
+  const tags = INITIAL_TAGS;
   const [messages, setMessages] = useState<Message[]>([
     {
       id: "welcome",
@@ -153,8 +123,6 @@ function InterviewWorkspace() {
     },
   ]);
 
-  const [pendingConfirmation, setPendingConfirmation] =
-    useState<Message | null>(null);
   const [activeSessionID, setActiveSessionID] = useState<string | null>(null);
   const [sessions, setSessions] = useState<SessionListItem[]>([]);
   const [sessionsLoading, setSessionsLoading] = useState(false);
@@ -168,9 +136,6 @@ function InterviewWorkspace() {
   const [isSending, setIsSending] = useState(false);
   const [capabilities, setCapabilities] = useState<ApplicationCapabilities | null>(null);
   const [inputDockHeight, setInputDockHeight] = useState(176);
-  const [selectedModelID, setSelectedModelID] = useState<string>(() =>
-    getSelectedModelID()
-  );
   const scrollRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   // resolveTime 为每条消息提供稳定的时间戳：历史消息用自带 time，实时消息按 id 缓存首次渲染时刻。
@@ -271,7 +236,6 @@ function InterviewWorkspace() {
     if (sessionID === activeSessionID) return;
     setActiveSessionID(sessionID);
     rememberSessionID(sessionID);
-    setPendingConfirmation(null);
     await loadSessionMessages(sessionID);
     await refreshPracticeState(sessionID);
   };
@@ -282,7 +246,6 @@ function InterviewWorkspace() {
       const sessionID = await createNewSession();
       setActiveSessionID(sessionID);
       rememberSessionID(sessionID);
-      setPendingConfirmation(null);
       setPracticeState(null);
       setMessages([WELCOME_MESSAGE]);
       setSessionDrawerOpen(false);
@@ -310,7 +273,6 @@ function InterviewWorkspace() {
     if (sessionID === activeSessionID) {
       const next = remaining[0]?.session_id ?? null;
       setActiveSessionID(next);
-      setPendingConfirmation(null);
       setPracticeState(null);
       if (next) {
         rememberSessionID(next);
@@ -326,61 +288,7 @@ function InterviewWorkspace() {
   // Auto-scroll to bottom on new messages
   useLayoutEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-  }, [messages, pendingConfirmation, inputDockHeight]);
-
-  // Helpers
-  const latestMealId = [...messages]
-    .reverse()
-    .find((m) => m.type === "meal-suggestion")?.id;
-  const latestActionId = [...messages]
-    .reverse()
-    .find((m) => m.type === "action-card")?.id;
-
-  const dismissMorningGreeting = () => {
-    setMessages((prev) =>
-      prev.filter((m) => m.id !== "morning-greeting")
-    );
-  };
-
-  const handleMorningReply = (reply: "recovered" | "still-tired") => {
-    dismissMorningGreeting();
-
-    if (reply === "recovered") {
-      setTags((prev) =>
-        prev.map((t) =>
-          t.id === "energy" ? { ...t, state: "dismissed" } : t
-        )
-      );
-      setTimeout(() => {
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: Date.now().toString(),
-            type: "ai",
-            content:
-              "太好了！精气神回来了 ✨ 今天继续保持，身体在慢慢向好的方向走。",
-          },
-        ]);
-      }, 400);
-    } else {
-      setTags((prev) =>
-        prev.map((t) =>
-          t.id === "energy" ? { ...t, state: "active" } : t
-        )
-      );
-      setTimeout(() => {
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: Date.now().toString(),
-            type: "ai",
-            content:
-              "没关系，身体需要休息的信号值得被认真对待 🫧 今天可以减少剧烈运动，多喝温水。",
-          },
-        ]);
-      }, 400);
-    }
-  };
+  }, [messages, inputDockHeight]);
 
   // streamAssistantReply 向后端发起一次流式对话，并把增量原地写入 targetId 对应的气泡。
   // clientMessageID 由调用方决定：首次发送用新 UUID，重试时复用原 UUID 命中后端幂等。
@@ -464,21 +372,6 @@ function InterviewWorkspace() {
     };
     setMessages((prev) => [...prev, userMessage]);
 
-    // 血糖录入 → 确认卡（本地演示交互，暂不走后端）。
-    if (text.includes("血糖") && /\d/.test(text)) {
-      const value = text.match(/\d+(\.\d+)?/)?.[0] || "0";
-      const confirmation: Message = {
-        id: Date.now().toString() + "-confirm",
-        type: "confirmation",
-        content: {
-          type: "blood-sugar",
-          data: { label: "今日血糖", value, unit: "mmol/L" },
-        },
-      };
-      setPendingConfirmation(confirmation);
-      return;
-    }
-
     // 其余自由对话走真实 chat 接口。先插入空占位气泡（显示三点动画），返回后原地替换。
     const typingId = Date.now().toString() + "-typing";
     setMessages((prev) => [
@@ -513,72 +406,6 @@ function InterviewWorkspace() {
     await streamAssistantReply(sessionID, text, clientMessageID, messageId, voiceCaptureID);
   };
 
-  const handleAcceptMeal = () => {
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: Date.now().toString(),
-        type: "ai",
-        content:
-          "太棒了！记得慢慢咀嚼，让身体更好地吸收营养。餐后记得测一下血糖哦～",
-      },
-    ]);
-  };
-
-  const handleRegenerateMeal = () => {
-    const newMeal: Message = {
-      id: Date.now().toString(),
-      type: "meal-suggestion",
-      content: {
-        meal: "🌅 午餐建议",
-        title: "烤三文鱼配时蔬",
-        emoji: "🐟",
-        description: "富含 Omega-3 的三文鱼配上低碳水蔬菜，既美味又健康。",
-        ingredients: ["三文鱼", "西兰花", "芦笋", "柠檬", "橄榄油"],
-        benefits:
-          "三文鱼中的 Omega-3 脂肪酸有助于改善胰岛素敏感性，搭配高纤维蔬菜能有效控制血糖上升速度。",
-        gi: 28,
-      },
-    };
-    setMessages((prev) => [...prev, newMeal]);
-  };
-
-  const handleToggleAction = (id: string) => {
-    const updated = actions.map((a) =>
-      a.id === id ? { ...a, completed: !a.completed } : a
-    );
-    setActions(updated);
-    setMessages((prev) =>
-      prev.map((msg) =>
-        msg.type === "action-card" && msg.id === latestActionId
-          ? { ...msg, content: updated }
-          : msg
-      )
-    );
-  };
-
-  const handleConfirmData = () => {
-    if (pendingConfirmation) {
-      setMessages((prev) => [...prev, pendingConfirmation]);
-      setPendingConfirmation(null);
-      setTimeout(() => {
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: Date.now().toString(),
-            type: "ai",
-            content:
-              "收到！你的血糖数据已记录。目前数值在正常范围内，继续保持哦～",
-          },
-        ]);
-      }, 500);
-    }
-  };
-
-  const handleCancelConfirmation = () => {
-    setPendingConfirmation(null);
-  };
-
   // handleStop 用户主动中止正在进行的流式回复。
   const handleStop = () => {
     abortRef.current?.abort();
@@ -594,25 +421,8 @@ function InterviewWorkspace() {
     void handleSendMessage(`${prompt.emoji} ${prompt.label}`);
   };
 
-  // handlePhoto 拍照/选图入口。图片识别后端管线尚未接入，先给出本地占位回复。
-  const handlePhoto = (file: File) => {
-    const base = Date.now().toString();
-    setMessages((prev) => [
-      ...prev,
-      { id: base + "-photo-user", type: "user", content: "📷 [已上传照片]" },
-      {
-        id: base + "-photo-ai",
-        type: "ai",
-        content:
-          "已收到照片～ 图片识别功能正在开发中，很快就能帮你分析饮食和营养了。",
-      },
-    ]);
-    void file;
-  };
-
-  // 对话是否已开始：只剩欢迎语且无待确认卡时视为未开始，此时欢迎语居中显示。
-  const conversationStarted =
-    pendingConfirmation != null || messages.some((m) => m.id !== "welcome");
+  // 对话是否已开始：只剩欢迎语时视为未开始，此时欢迎语居中显示。
+  const conversationStarted = messages.some((m) => m.id !== "welcome");
 
   return (
     <div className="size-full flex flex-col overflow-hidden bg-background relative">
@@ -660,13 +470,6 @@ function InterviewWorkspace() {
           <AnimatePresence>
             {messages.map((message) => {
               switch (message.type) {
-                case "morning-greeting":
-                  return (
-                    <MorningGreetingCard
-                      key={message.id}
-                      onReply={handleMorningReply}
-                    />
-                  );
                 case "user":
                   return (
                     <UserMessage
@@ -691,60 +494,12 @@ function InterviewWorkspace() {
                       }
                     />
                   );
-                case "meal-card":
-                  return <MealCard key={message.id} />;
-                case "meal-suggestion":
-                  return (
-                    <MealSuggestionCard
-                      key={message.id}
-                      {...message.content}
-                      collapsed={message.id !== latestMealId}
-                      onAccept={handleAcceptMeal}
-                      onRegenerate={handleRegenerateMeal}
-                    />
-                  );
-                case "action-card":
-                  return (
-                    <ActionCard
-                      key={message.id}
-                      actions={
-                        message.id === latestActionId
-                          ? actions
-                          : message.content
-                      }
-                      collapsed={message.id !== latestActionId}
-                      onToggle={handleToggleAction}
-                    />
-                  );
-                case "warning":
-                  return (
-                    <WarningCard key={message.id} {...message.content} />
-                  );
-                case "confirmation":
-                  return (
-                    <ConfirmationCard
-                      key={message.id}
-                      {...message.content}
-                      onConfirm={handleConfirmData}
-                      onCancel={handleCancelConfirmation}
-                    />
-                  );
                 default:
                   return null;
               }
             })}
           </AnimatePresence>
 
-          <AnimatePresence>
-            {pendingConfirmation && (
-              <ConfirmationCard
-                key={pendingConfirmation.id}
-                {...pendingConfirmation.content}
-                onConfirm={handleConfirmData}
-                onCancel={handleCancelConfirmation}
-              />
-            )}
-          </AnimatePresence>
         </div>
             )}
           </div>
@@ -757,15 +512,8 @@ function InterviewWorkspace() {
             onSelectPrompt={handleSelectPracticePrompt}
             realtimeVoiceEnabled={capabilities?.realtime_voice === true}
             voiceCapabilitiesLoaded={capabilities !== null}
-            onPhoto={handlePhoto}
             isResponding={isSending}
             onStop={handleStop}
-            models={MODELS}
-            selectedModelID={selectedModelID}
-            onSelectModel={(id) => {
-              setSelectedModelID(id);
-              rememberModelID(id);
-            }}
             onHeightChange={setInputDockHeight}
           />
 

@@ -89,7 +89,7 @@ func TestListSessionsHandlerReturnsAuthenticatedUsersSessions(t *testing.T) {
 		listResult: []service.SessionListItem{
 			{
 				SessionID:     "session_0123456789abcdef0123456789abcdef",
-				Title:         "体检异常咨询",
+				Title:         "Kafka 异常排查",
 				Status:        "active",
 				MessageCount:  4,
 				LastMessageAt: &lastMessageAt,
@@ -110,7 +110,7 @@ func TestListSessionsHandlerReturnsAuthenticatedUsersSessions(t *testing.T) {
 		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
 	}
 	body := recorder.Body.String()
-	if !strings.Contains(body, "session_0123456789abcdef0123456789abcdef") || !strings.Contains(body, "体检异常咨询") {
+	if !strings.Contains(body, "session_0123456789abcdef0123456789abcdef") || !strings.Contains(body, "Kafka 异常排查") {
 		t.Fatalf("body = %q, want the repository's session item", body)
 	}
 }
@@ -167,15 +167,15 @@ func TestListSessionMessagesHandlerReturnsOwnedSessionMessages(t *testing.T) {
 	const sessionID = "session_0123456789abcdef0123456789abcdef"
 	messageRepository := &handlerMessageRepository{
 		sessionMessages: []service.SessionMessage{
-			{MessageID: "m1", Role: "user", Content: "早上体检报告有点异常", Seq: 1},
+			{MessageID: "m1", Role: "user", Content: "Kafka 消费延迟突然升高", Seq: 1},
 			{
-				MessageID: "m2", Role: "assistant", Content: "具体是哪项指标异常呢？", Seq: 2,
+				MessageID: "m2", Role: "assistant", Content: "先确认是生产速度上升还是消费能力下降。", Seq: 2,
 				Retrieval: &service.MessageRetrieval{
 					RequestID: "00000000-0000-4000-8000-000000000099",
 					Status:    service.RetrievalStatusOK, CandidateCount: 1,
 					Sources: []service.SessionRetrievalSource{{
 						Ref: "S1", SourceChunkID: "chunk-1", DocumentID: "doc-1",
-						DocumentTitle: "体检资料", VersionNo: 2, OriginLabel: "用户笔记", TrustLabel: "用户已确认",
+						DocumentTitle: "Kafka 排障笔记", VersionNo: 2, OriginLabel: "用户笔记", TrustLabel: "用户已确认",
 					}},
 				},
 			},
@@ -193,13 +193,13 @@ func TestListSessionMessagesHandlerReturnsOwnedSessionMessages(t *testing.T) {
 		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
 	}
 	body := recorder.Body.String()
-	userIndex := strings.Index(body, "早上体检报告有点异常")
-	assistantIndex := strings.Index(body, "具体是哪项指标异常呢？")
+	userIndex := strings.Index(body, "Kafka 消费延迟突然升高")
+	assistantIndex := strings.Index(body, "先确认是生产速度上升还是消费能力下降。")
 	if userIndex < 0 || assistantIndex < 0 || userIndex >= assistantIndex {
 		t.Fatalf("body = %q, want both messages in seq order", body)
 	}
 	if !strings.Contains(body, `"request_id":"00000000-0000-4000-8000-000000000099"`) ||
-		!strings.Contains(body, `"document_title":"体检资料"`) ||
+		!strings.Contains(body, `"document_title":"Kafka 排障笔记"`) ||
 		!strings.Contains(body, `"ref":"S1"`) {
 		t.Fatalf("body = %q, want persisted retrieval sources", body)
 	}

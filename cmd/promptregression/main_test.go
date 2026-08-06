@@ -79,7 +79,7 @@ func TestEvaluateReportsAllFailedExpectations(t *testing.T) {
 }
 
 func TestEvaluateAcceptsExplicitInformationRequestAsQuestion(t *testing.T) {
-	failures := evaluate("请告诉我体检报告中哪项指标异常。", assertions{MustAskQuestion: true})
+	failures := evaluate("请告诉我这段项目经历最值得追问哪一点。", assertions{MustAskQuestion: true})
 	if len(failures) != 0 {
 		t.Fatalf("failures = %v, want explicit information request to count as a question", failures)
 	}

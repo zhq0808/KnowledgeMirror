@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
-import { Mic, Send, Plus, Square, Sparkles, ChevronDown, Check, X } from "lucide-react";
-import type { ModelOption } from "../api/chat";
+import { Mic, Send, Square, X } from "lucide-react";
 import { useRealtimeTranscription } from "../lib/useRealtimeTranscription";
 
 const PROMPTS = [
@@ -19,12 +18,8 @@ interface InputDockProps {
   onSelectPrompt: (prompt: { emoji: string; label: string }) => void;
   realtimeVoiceEnabled?: boolean;
   voiceCapabilitiesLoaded?: boolean;
-  onPhoto: (file: File) => void;
   isResponding: boolean;
   onStop: () => void;
-  models: ModelOption[];
-  selectedModelID: string;
-  onSelectModel: (modelID: string) => void;
   onHeightChange?: (height: number) => void;
 }
 
@@ -34,17 +29,11 @@ export function InputDock({
   onSelectPrompt,
   realtimeVoiceEnabled = false,
   voiceCapabilitiesLoaded = false,
-  onPhoto,
   isResponding,
   onStop,
-  models,
-  selectedModelID,
-  onSelectModel,
   onHeightChange,
 }: InputDockProps) {
   const [input, setInput] = useState("");
-  const [modelMenuOpen, setModelMenuOpen] = useState(false);
-  const fileInputRef = useRef<HTMLInputElement>(null);
   const textInputRef = useRef<HTMLInputElement>(null);
   const dockRef = useRef<HTMLDivElement>(null);
   const realtime = useRealtimeTranscription();
@@ -74,9 +63,6 @@ export function InputDock({
     return () => observer.disconnect();
   }, [onHeightChange]);
 
-  const selectedModel =
-    models.find((m) => m.id === selectedModelID) ?? models[0];
-
   const submitText = (text: string) => {
     // 只有这次发送确实来自录音时才带 capture_id；
     // 用户把转写改得面目全非也没关系，原始转写在后端原样存着，谁也没覆盖谁。
@@ -89,15 +75,6 @@ export function InputDock({
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!voiceBusy && input.trim()) submitText(input.trim());
-  };
-
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      onPhoto(file);
-    }
-    // 重置，允许连续选择同一文件时也能再次触发 change。
-    e.target.value = "";
   };
 
   const stopRealtime = () => {
@@ -153,65 +130,8 @@ export function InputDock({
 
   return (
     <div ref={dockRef} className="absolute bottom-[80px] left-0 right-0 z-30 bg-gradient-to-t from-[#F6F8F4] via-[#F6F8F4]/96 to-transparent px-5 pb-4 pt-8">
-      {/* 快捷提示行；模型选择器放在同一行最左侧（在滚动容器之外，避免向上弹出的菜单被裁剪）。 */}
-      <div className="flex items-center gap-2 mb-3">
-        {/* 模型选择。当前仅前端选择与本地记忆，后端支持后再随请求下发。 */}
-        <div className="relative flex-shrink-0">
-          <button
-            type="button"
-            onClick={() => setModelMenuOpen((v) => !v)}
-            className="flex items-center gap-1.5 rounded-full bg-white px-3 py-2 text-xs text-gray-600 shadow-[0_2px_12px_rgba(0,0,0,0.05)] hover:bg-gray-50 transition-colors"
-          >
-            <Sparkles size={13} className="text-primary" />
-            <span className="font-medium">{selectedModel?.name}</span>
-            <ChevronDown
-              size={13}
-              className={`opacity-50 transition-transform ${
-                modelMenuOpen ? "rotate-180" : ""
-              }`}
-            />
-          </button>
-
-          {modelMenuOpen && (
-            <>
-              <div
-                className="fixed inset-0 z-10"
-                onClick={() => setModelMenuOpen(false)}
-              />
-              <div className="absolute bottom-full left-0 z-20 mb-1.5 w-56 overflow-hidden rounded-2xl border border-black/5 bg-white py-1 shadow-[0_8px_32px_rgba(0,0,0,0.12)]">
-                {models.map((model) => {
-                  const active = model.id === selectedModelID;
-                  return (
-                    <button
-                      key={model.id}
-                      type="button"
-                      onClick={() => {
-                        onSelectModel(model.id);
-                        setModelMenuOpen(false);
-                      }}
-                      className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-gray-50"
-                    >
-                      <span className="min-w-0 flex-1">
-                        <span className="block text-[13px] font-medium text-gray-800">
-                          {model.name}
-                        </span>
-                        <span className="block truncate text-[11px] text-gray-400">
-                          {model.desc}
-                        </span>
-                      </span>
-                      {active && (
-                        <Check size={15} className="flex-shrink-0 text-primary" />
-                      )}
-                    </button>
-                  );
-                })}
-              </div>
-            </>
-          )}
-        </div>
-
-        {/* 快捷提示（可横向滚动） */}
-        <div className="flex items-center gap-2 overflow-x-auto no-scrollbar">
+      {/* 快捷提示（可横向滚动） */}
+      <div className="mb-3 flex items-center gap-2 overflow-x-auto no-scrollbar">
           {PROMPTS.map((p) => (
             <button
               key={p.label}
@@ -223,7 +143,6 @@ export function InputDock({
               <span>{p.label}</span>
             </button>
           ))}
-        </div>
       </div>
 
       {/* 状态条只描述实时链路；转写正文始终显示在原输入框中。 */}
@@ -266,24 +185,6 @@ export function InputDock({
       )}
 
       <form onSubmit={handleSubmit} className="flex items-center gap-2.5">
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept="image/*"
-          capture="environment"
-          className="hidden"
-          onChange={handleFileChange}
-        />
-        <button
-          type="button"
-          onClick={() => fileInputRef.current?.click()}
-          aria-label="拍照 / 上传图片"
-          title="拍照 / 上传图片"
-          className="w-11 h-11 rounded-full flex items-center justify-center shadow-[0_2px_16px_rgba(0,0,0,0.07)] bg-white text-gray-500 hover:bg-gray-50 transition-colors flex-shrink-0"
-        >
-          <Plus className="w-[20px] h-[20px]" />
-        </button>
-
         <div className="flex-1 relative">
           <input
             ref={textInputRef}
