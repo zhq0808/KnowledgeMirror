@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  encodePCM16LEWav,
   float32ToPCM16LE,
   mixToMono,
   PCMFrameAccumulator,
@@ -39,6 +40,25 @@ test("Float32 conversion saturates and writes little-endian PCM16", () => {
     Array.from({ length: pcm.length / 2 }, (_, index) => view.getInt16(index * 2, true)),
     [-32768, -32768, -16384, 0, 16383, 32767, 32767, 0],
   );
+});
+
+test("PCM chunks are wrapped in a 16 kHz mono PCM16 WAV", async () => {
+  const wav = encodePCM16LEWav([
+    Uint8Array.of(0x34, 0x12),
+    Uint8Array.of(0xcc, 0xed),
+  ]);
+  const bytes = new Uint8Array(await wav.arrayBuffer());
+  const view = new DataView(bytes.buffer);
+
+  assert.equal(wav.type, "audio/wav");
+  assert.equal(new TextDecoder().decode(bytes.subarray(0, 4)), "RIFF");
+  assert.equal(new TextDecoder().decode(bytes.subarray(8, 12)), "WAVE");
+  assert.equal(view.getUint16(20, true), 1);
+  assert.equal(view.getUint16(22, true), 1);
+  assert.equal(view.getUint32(24, true), 16000);
+  assert.equal(view.getUint16(34, true), 16);
+  assert.equal(view.getUint32(40, true), 4);
+  assert.deepEqual(Array.from(bytes.subarray(44)), [0x34, 0x12, 0xcc, 0xed]);
 });
 
 test("multiple input channels are averaged into mono", () => {

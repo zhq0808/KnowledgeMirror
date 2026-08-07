@@ -90,6 +90,15 @@ voice:
   max_ambiguous_terms: 5          # 单次最多提示几个疑似听错的术语
   glossary_path: "prompts/voice_glossary_v1.txt"
   transcribing_stale_seconds: 120 # 超过此时长仍卡在 transcribing 的记录允许被重试接管
+  # 实时 ASR 不可用时，浏览器录完 WAV 后上传到 MiMo ASR 转写。
+  upload:
+    enabled: true
+    provider: "mimo_asr"
+    base_url: "https://api.xiaomimimo.com/v1"
+    model: "mimo-v2.5-asr"
+    language: "zh"
+    timeout_seconds: 60
+    # api_key 只走 .env 的 VOICE_UPLOAD_API_KEY，禁止写入 YAML。
   # 实时 ASR 使用独立 DashScope WebSocket 协议；启用且凭据完整时注册浏览器 WebSocket 路由。
   realtime:
     enabled: false

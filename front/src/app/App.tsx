@@ -748,7 +748,10 @@ function InterviewWorkspace() {
             sessionID={activeSessionID}
             onSelectPrompt={handleSelectPracticePrompt}
             realtimeVoiceEnabled={capabilities?.realtime_voice === true}
-            voiceCapabilitiesLoaded={!capabilityLoading && capabilities !== null}
+            fileVoiceEnabled={capabilities?.file_voice === true}
+            voiceCapabilityLoading={capabilityLoading}
+            voiceCapabilityError={capabilityError}
+            onRetryVoiceCapabilities={() => void retryCapabilities()}
             isResponding={isSending}
             disabled={transitionBusy || Boolean(launchingTaskID)}
             onStop={handleStop}

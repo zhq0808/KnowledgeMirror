@@ -93,10 +93,11 @@ func (s *Server) routes() {
 	s.engine.Use(traceMiddleware())
 	s.engine.Use(recoverMiddleware(s.log))
 	s.engine.Use(accessLogMiddleware(s.log))
-	// 全局请求体上限；资料上传路径由路由级中间件放宽到更大的上限，
+	// 全局请求体上限；资料上传和录音上传路径由路由级中间件放宽，
 	// 这里必须跳过它们，否则内层 http.MaxBytesReader 仍会被外层的小上限截断。
 	s.engine.Use(func(c *gin.Context) {
-		if c.Request.Method == http.MethodPost && c.Request.URL.Path == "/api/v1/documents" {
+		if c.Request.Method == http.MethodPost &&
+			(c.Request.URL.Path == "/api/v1/documents" || c.Request.URL.Path == voiceCapturePath) {
 			c.Next()
 			return
 		}
@@ -139,6 +140,13 @@ func (s *Server) routes() {
 			coach.GET("/gaps", s.coachGapsHandler)
 		}
 
+		if s.voice != nil && s.voice.UploadEnabled() {
+			voice := protected.Group("/voice")
+			voice.POST("/captures",
+				bodyLimitMiddleware(feynmanAudioBodyLimitBytes(s.voice.Limits().MaxAudioBytes)),
+				s.createVoiceCaptureHandler)
+			voice.GET("/captures/:capture_id", s.getVoiceCaptureHandler)
+		}
 		if s.realtimeVoice != nil {
 			protected.GET("/voice/realtime", s.realtimeVoiceHandler)
 		}

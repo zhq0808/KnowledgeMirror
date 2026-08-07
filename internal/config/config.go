@@ -52,7 +52,20 @@ type VoiceConfig struct {
 	MaxAmbiguousTerms       int                 `yaml:"max_ambiguous_terms"       env:"MAX_AMBIGUOUS_TERMS"       env-default:"5"`
 	GlossaryPath            string              `yaml:"glossary_path"             env:"GLOSSARY_PATH"             env-default:"prompts/voice_glossary_v1.txt"`
 	TranscribingStaleSecond int                 `yaml:"transcribing_stale_seconds" env:"TRANSCRIBING_STALE_SECONDS" env-default:"120"`
+	Upload                  VoiceUploadConfig   `yaml:"upload" env-prefix:"UPLOAD_"`
 	Realtime                VoiceRealtimeConfig `yaml:"realtime" env-prefix:"REALTIME_"`
+}
+
+// VoiceUploadConfig 控制“录音结束后上传并转写”的 MiMo ASR 接入。
+// APIKey 只从 VOICE_UPLOAD_API_KEY 读取，禁止写入 YAML。
+type VoiceUploadConfig struct {
+	Enabled        bool   `yaml:"enabled"         env:"ENABLED"         env-default:"true"`
+	Provider       string `yaml:"provider"        env:"PROVIDER"        env-default:"mimo_asr"`
+	APIKey         string `yaml:"-"               env:"API_KEY"`
+	BaseURL        string `yaml:"base_url"        env:"BASE_URL"        env-default:"https://api.xiaomimimo.com/v1"`
+	Model          string `yaml:"model"           env:"MODEL"           env-default:"mimo-v2.5-asr"`
+	Language       string `yaml:"language"        env:"LANGUAGE"        env-default:"zh"`
+	TimeoutSeconds int    `yaml:"timeout_seconds" env:"TIMEOUT_SECONDS" env-default:"60"`
 }
 
 // VoiceRealtimeConfig 控制 Go 到实时 ASR 供应商的协议客户端及后续流式编排预算。

@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"KnowledgeMirror/internal/service"
+	"KnowledgeMirror/internal/stt"
 )
 
 func TestCapabilitiesHandlerReportsInjectedServices(t *testing.T) {

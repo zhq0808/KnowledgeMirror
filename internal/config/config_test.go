@@ -29,6 +29,36 @@ func TestResolveDerivedDefaultsKeepsExplicitMemoryExtractorModel(t *testing.T) {
 	}
 }
 
+func TestLoadVoiceUploadDefaultsAndEnvironment(t *testing.T) {
+	configPath := writeConfigFile(t, "voice:\n  upload:\n    enabled: true\n")
+	t.Setenv("VOICE_UPLOAD_API_KEY", "test-upload-key")
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	upload := cfg.Voice.Upload
+	if !upload.Enabled || upload.Provider != "mimo_asr" || upload.APIKey != "test-upload-key" {
+		t.Fatalf("upload config = %#v", upload)
+	}
+	if upload.Model != "mimo-v2.5-asr" || upload.Language != "zh" || upload.TimeoutSeconds != 60 {
+		t.Fatalf("upload defaults = %#v", upload)
+	}
+}
+
+func TestLoadVoiceUploadAPIKeyCannotComeFromYAML(t *testing.T) {
+	configPath := writeConfigFile(t, "voice:\n  upload:\n    api_key: yaml-secret-must-be-ignored\n")
+	t.Setenv("VOICE_UPLOAD_API_KEY", "")
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if cfg.Voice.Upload.APIKey != "" {
+		t.Fatalf("API key loaded from YAML: %q", cfg.Voice.Upload.APIKey)
+	}
+}
+
 func TestLoadVoiceRealtimeDefaultsAndEnvironment(t *testing.T) {
 	configPath := writeConfigFile(t, "voice:\n  realtime:\n    enabled: true\n")
 	t.Setenv("VOICE_REALTIME_API_KEY", "test-realtime-key")

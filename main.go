@@ -280,9 +280,21 @@ func run() error {
 		log.Info("对话式费曼学习未启用（FEYNMAN_DIALOG_ENABLED=false）")
 	}
 
-	// 通用语音输入：普通对话输入区的 Push-to-Talk。
-	// 它和上面的语音费曼练习共用同一个 sttProvider 实例：同一套供应商配置只存一份，
-	// 避免两处配置飘移后“这里能转写那里不能”这种排查起来最费劲的问题。
+	// 通用语音输入：优先使用实时 ASR；未启用实时服务时，可以在录音结束后上传到 MiMo 转写。
+	var uploadSTTProvider stt.Provider
+	if cfg.Voice.Enabled && cfg.Voice.Upload.Enabled && cfg.Voice.Upload.APIKey != "" {
+		if cfg.Voice.Upload.Provider != stt.MiMoASRProviderName {
+			log.Warn("未知的录音上传 STT 供应商，已回退到 MiMo ASR", "configured", cfg.Voice.Upload.Provider)
+		}
+		uploadSTTProvider = stt.NewMiMoASRProvider(
+			cfg.Voice.Upload.APIKey,
+			cfg.Voice.Upload.BaseURL,
+			cfg.Voice.Upload.Model,
+			cfg.Voice.Upload.Language,
+			time.Duration(cfg.Voice.Upload.TimeoutSeconds)*time.Second,
+		)
+	}
+
 	var voiceService *service.VoiceCaptureService
 	if cfg.Voice.Enabled {
 		// 词表加载失败不阻断启动：它只影响“术语可能被听错”这一条提示，
@@ -294,6 +306,7 @@ func run() error {
 		}
 		voiceService = service.NewVoiceCaptureService(
 			store.NewPostgresVoiceCaptureRepository(db),
+			uploadSTTProvider,
 			glossary,
 			service.VoiceLimits{
 				MaxAudioBytes:      cfg.Voice.MaxAudioBytes,
@@ -305,9 +318,16 @@ func run() error {
 			},
 			log,
 		)
-		log.Info("实时语音结果持久化已启用",
+		log.Info("语音结果持久化已启用",
 			"glossary_terms", glossary.Size(),
 			"min_confidence", cfg.Voice.MinConfidence)
+		if voiceService.UploadEnabled() {
+			log.Info("录音上传转写已启用", "stt_provider", voiceService.STTProviderName(), "model", cfg.Voice.Upload.Model)
+		} else if cfg.Voice.Upload.Enabled {
+			log.Info("录音上传转写未启用（未配置 VOICE_UPLOAD_API_KEY）")
+		} else {
+			log.Info("录音上传转写未启用（VOICE_UPLOAD_ENABLED=false）")
+		}
 	} else {
 		log.Info("通用语音输入未启用（VOICE_ENABLED=false）")
 	}

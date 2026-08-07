@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"KnowledgeMirror/internal/stt"
 )
 
 // ---------------------------------------------------------------------------
@@ -150,13 +152,15 @@ type VoiceLimits struct {
 // VoiceCaptureService 固化实时 ASR 结果并维护语音记录与消息的关联。
 type VoiceCaptureService struct {
 	repo     VoiceCaptureRepository
+	stt      stt.Provider
 	glossary *TermGlossary
 	limits   VoiceLimits
 	log      *slog.Logger
 }
 
-// NewVoiceCaptureService 构造实时语音结果持久化服务。glossary 为 nil 时关闭术语歧义检测。
-func NewVoiceCaptureService(repo VoiceCaptureRepository, glossary *TermGlossary, limits VoiceLimits, log *slog.Logger) *VoiceCaptureService {
+// NewVoiceCaptureService 构造语音结果持久化服务。sttProvider 为 nil 时只支持实时结果固化，
+// glossary 为 nil 时关闭术语歧义检测。
+func NewVoiceCaptureService(repo VoiceCaptureRepository, sttProvider stt.Provider, glossary *TermGlossary, limits VoiceLimits, log *slog.Logger) *VoiceCaptureService {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -166,11 +170,82 @@ func NewVoiceCaptureService(repo VoiceCaptureRepository, glossary *TermGlossary,
 	if limits.MaxAmbiguousTerms <= 0 {
 		limits.MaxAmbiguousTerms = 5
 	}
-	return &VoiceCaptureService{repo: repo, glossary: glossary, limits: limits, log: log}
+	return &VoiceCaptureService{repo: repo, stt: sttProvider, glossary: glossary, limits: limits, log: log}
 }
 
 // Limits 返回当前生效的预算配置，供接口层提前校验请求体大小。
 func (s *VoiceCaptureService) Limits() VoiceLimits { return s.limits }
+
+// UploadEnabled 表示当前服务是否配置了可执行录音上传转写的供应商。
+func (s *VoiceCaptureService) UploadEnabled() bool { return s != nil && s.stt != nil }
+
+// STTProviderName 返回录音上传转写使用的供应商标识。
+func (s *VoiceCaptureService) STTProviderName() string {
+	if !s.UploadEnabled() {
+		return ""
+	}
+	return s.stt.Name()
+}
+
+// Capture 接收一段完整录音并同步完成转写。
+// 转写失败也会固化为 failed 记录；只有输入或存储错误才直接返回 error。
+func (s *VoiceCaptureService) Capture(ctx context.Context, userID, sessionID string, audio []byte, mimeType string, durationMs *int) (VoiceCapture, error) {
+	if !s.UploadEnabled() {
+		return VoiceCapture{}, invalidVoiceInput("录音上传转写服务未配置")
+	}
+	userID, sessionID, err := s.validateInput(userID, sessionID, audio, mimeType, durationMs)
+	if err != nil {
+		return VoiceCapture{}, err
+	}
+	claimed, won, err := s.claim(ctx, userID, sessionID, audio, mimeType, durationMs, s.stt.Name())
+	if err != nil {
+		return VoiceCapture{}, err
+	}
+	if !won {
+		s.log.Info("命中已有语音记录，跳过重复 STT 调用",
+			"session_id", sessionID, "capture_id", claimed.CaptureID)
+		return claimed, nil
+	}
+
+	params := CompleteVoiceCaptureParams{
+		CaptureID:   claimed.CaptureID,
+		UserID:      userID,
+		STTProvider: s.stt.Name(),
+	}
+	transcript, sttErr := s.stt.Transcribe(ctx, audio, mimeType)
+	switch {
+	case sttErr != nil:
+		s.log.Warn("语音转写失败", "session_id", sessionID, "capture_id", claimed.CaptureID,
+			"provider", s.stt.Name(), "error", sttErr)
+		params.Status = VoiceCaptureStatusFailed
+		params.TranscriptError = truncateFeynmanError(sttErr.Error(), 2000)
+	default:
+		text := strings.TrimSpace(transcript.Text)
+		switch {
+		case text == "":
+			params.Status = VoiceCaptureStatusFailed
+			params.TranscriptError = emptyTranscriptError
+		case utf8.RuneCountInString(text) > s.limits.MaxTranscriptChars:
+			params.Status = VoiceCaptureStatusFailed
+			params.TranscriptError = fmt.Sprintf("STT 转写超过 %d 字上限", s.limits.MaxTranscriptChars)
+		default:
+			params.Status = VoiceCaptureStatusTranscribed
+			params.RawTranscript = text
+			params.STTProvider = strings.TrimSpace(transcript.Provider)
+			if params.STTProvider == "" {
+				params.STTProvider = s.stt.Name()
+			}
+			params.STTModel = strings.TrimSpace(transcript.Model)
+			params.STTRequestID = strings.TrimSpace(transcript.RequestID)
+			params.Confidence = transcript.Confidence
+			params.AmbiguousTerms = s.glossary.AmbiguousTerms(text, s.limits.MaxAmbiguousTerms)
+		}
+	}
+	params.NeedsConfirmation, params.ConfirmationReason = s.judgeConfirmation(params)
+	completeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	return s.repo.Complete(completeCtx, params)
+}
 
 // FinalizeRealtime 将实时供应商已经生成的最终文本和完整 WAV 一次性固化。
 // 它不会再次调用文件式 ASR，避免同一段音频产生第二份文本和重复费用。

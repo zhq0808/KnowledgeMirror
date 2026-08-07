@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"KnowledgeMirror/internal/stt"
 )
 
 // ---------------------------------------------------------------------------
@@ -114,7 +116,20 @@ func (r *fakeVoiceRepository) BindMessage(_ context.Context, _, _, captureID, me
 	return nil
 }
 
-func newTestVoiceService(t *testing.T) (*VoiceCaptureService, *fakeVoiceRepository) {
+type fakeUploadSTTProvider struct {
+	transcript stt.Transcript
+	err        error
+	calls      int
+}
+
+func (p *fakeUploadSTTProvider) Name() string { return "fake_upload" }
+
+func (p *fakeUploadSTTProvider) Transcribe(_ context.Context, _ []byte, _ string) (stt.Transcript, error) {
+	p.calls++
+	return p.transcript, p.err
+}
+
+func newTestVoiceServiceWithProvider(t *testing.T, provider stt.Provider) (*VoiceCaptureService, *fakeVoiceRepository) {
 	t.Helper()
 	repo := newFakeVoiceRepository()
 	glossary := NewTermGlossary([]string{"幂等|密等,读百", "RocketMQ|火箭MQ"})
@@ -125,7 +140,65 @@ func newTestVoiceService(t *testing.T) (*VoiceCaptureService, *fakeVoiceReposito
 		MinConfidence:      0.6,
 		MaxAmbiguousTerms:  5,
 	}
-	return NewVoiceCaptureService(repo, glossary, limits, discardLogger()), repo
+	return NewVoiceCaptureService(repo, provider, glossary, limits, discardLogger()), repo
+}
+
+func newTestVoiceService(t *testing.T) (*VoiceCaptureService, *fakeVoiceRepository) {
+	return newTestVoiceServiceWithProvider(t, nil)
+}
+
+func TestVoiceCaptureTranscribesPersistsAndDeduplicates(t *testing.T) {
+	confidence := 0.9
+	provider := &fakeUploadSTTProvider{transcript: stt.Transcript{
+		Text: "这里用密等保证请求不会重复执行", Provider: "fake_upload",
+		Model: "fake-model", RequestID: "req-1", Confidence: &confidence,
+	}}
+	voice, _ := newTestVoiceServiceWithProvider(t, provider)
+	durationMs := 1200
+
+	first, err := voice.Capture(context.Background(), "usr_1", "session_1", []byte("wav-data"), "audio/wav", &durationMs)
+	if err != nil {
+		t.Fatalf("Capture() error = %v", err)
+	}
+	if first.Status != VoiceCaptureStatusTranscribed || first.RawTranscript == "" {
+		t.Fatalf("capture = %+v, want transcribed", first)
+	}
+	if first.STTModel != "fake-model" || first.STTRequestID != "req-1" {
+		t.Fatalf("STT metadata = %+v", first)
+	}
+	if len(first.AmbiguousTerms) != 1 || first.AmbiguousTerms[0].Term != "幂等" {
+		t.Fatalf("ambiguous terms = %+v", first.AmbiguousTerms)
+	}
+
+	second, err := voice.Capture(context.Background(), "usr_1", "session_1", []byte("wav-data"), "audio/wav", &durationMs)
+	if err != nil {
+		t.Fatalf("duplicate Capture() error = %v", err)
+	}
+	if second.CaptureID != first.CaptureID || provider.calls != 1 {
+		t.Fatalf("duplicate capture=%q first=%q provider calls=%d", second.CaptureID, first.CaptureID, provider.calls)
+	}
+}
+
+func TestVoiceCapturePersistsProviderFailure(t *testing.T) {
+	provider := &fakeUploadSTTProvider{err: errors.New("upstream unavailable")}
+	voice, _ := newTestVoiceServiceWithProvider(t, provider)
+	capture, err := voice.Capture(context.Background(), "usr_1", "session_1", []byte("wav-data"), "audio/wav", nil)
+	if err != nil {
+		t.Fatalf("Capture() error = %v", err)
+	}
+	if capture.Status != VoiceCaptureStatusFailed || capture.TranscriptError != "upstream unavailable" {
+		t.Fatalf("capture = %+v, want failed provider result", capture)
+	}
+}
+
+func TestVoiceCaptureRequiresUploadProvider(t *testing.T) {
+	voice, _ := newTestVoiceService(t)
+	if voice.UploadEnabled() {
+		t.Fatal("nil provider must not report upload enabled")
+	}
+	if _, err := voice.Capture(context.Background(), "usr_1", "session_1", []byte("wav"), "audio/wav", nil); err == nil {
+		t.Fatal("Capture() without provider should fail")
+	}
 }
 
 func TestVoiceFinalizeRealtimePersistsProviderResultWithoutCallingFileSTT(t *testing.T) {

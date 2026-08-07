@@ -1,5 +1,6 @@
 export const PCM_TARGET_SAMPLE_RATE = 16000;
 export const PCM_FRAME_BYTES = 3200;
+export const PCM16_WAV_MIME_TYPE = "audio/wav";
 
 export function mixToMono(channels: readonly Float32Array[]): Float32Array {
   if (channels.length === 0) return new Float32Array(0);
@@ -92,6 +93,38 @@ export function float32ToPCM16LE(samples: Float32Array): Uint8Array {
   return pcm;
 }
 
+export function encodePCM16LEWav(
+  chunks: readonly Uint8Array[],
+  sampleRate: number = PCM_TARGET_SAMPLE_RATE,
+): Blob {
+  if (sampleRate <= 0) throw new RangeError("sampleRate must be positive");
+
+  const dataBytes = chunks.reduce((total, chunk) => {
+    if (chunk.byteLength % 2 !== 0) {
+      throw new RangeError("PCM16 data must contain an even number of bytes");
+    }
+    return total + chunk.byteLength;
+  }, 0);
+  const header = new ArrayBuffer(44);
+  const view = new DataView(header);
+
+  writeAscii(view, 0, "RIFF");
+  view.setUint32(4, 36 + dataBytes, true);
+  writeAscii(view, 8, "WAVE");
+  writeAscii(view, 12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeAscii(view, 36, "data");
+  view.setUint32(40, dataBytes, true);
+
+  return new Blob([header, ...chunks], { type: PCM16_WAV_MIME_TYPE });
+}
+
 export class PCMFrameAccumulator {
   private pending: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
   private readonly frameBytes: number;
@@ -144,6 +177,12 @@ export class StreamingPCMEncoder {
     const tail = this.frames.flush();
     if (tail) frames.push(tail);
     return frames;
+  }
+}
+
+function writeAscii(view: DataView, offset: number, text: string): void {
+  for (let index = 0; index < text.length; index += 1) {
+    view.setUint8(offset + index, text.charCodeAt(index));
   }
 }
 

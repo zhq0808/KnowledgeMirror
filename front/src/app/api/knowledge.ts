@@ -29,7 +29,7 @@ export class APIError extends Error {
 }
 
 // request 统一拆包响应信封。data 允许为空（如删除接口），由调用方决定是否使用。
-async function request<T>(
+export async function request<T>(
   path: string,
   init: RequestInit,
   fallbackMessage: string,

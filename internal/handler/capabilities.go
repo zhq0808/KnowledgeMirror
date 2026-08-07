@@ -4,6 +4,7 @@ import "github.com/gin-gonic/gin"
 
 type applicationCapabilities struct {
 	RealtimeVoice bool `json:"realtime_voice"`
+	FileVoice     bool `json:"file_voice"`
 	Speech        bool `json:"speech"`
 	Coach         bool `json:"coach"`
 }
@@ -13,6 +14,7 @@ type applicationCapabilities struct {
 func (s *Server) capabilitiesHandler(c *gin.Context) {
 	ok(c, applicationCapabilities{
 		RealtimeVoice: s.realtimeVoice != nil,
+		FileVoice:     s.voice != nil && s.voice.UploadEnabled(),
 		Speech:        s.speech != nil,
 		Coach:         s.coach != nil && s.practice != nil,
 	})

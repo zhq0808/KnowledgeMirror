@@ -6,6 +6,7 @@ interface APIResponse<T> {
 
 export interface ApplicationCapabilities {
   realtime_voice: boolean;
+  file_voice: boolean;
   speech: boolean;
   coach: boolean;
 }
