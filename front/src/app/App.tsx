@@ -214,32 +214,46 @@ function InterviewWorkspace() {
     }
   };
 
-  const switchSession = useCallback(
-    async (sessionID: string, options: { load?: boolean } = {}) => {
-      if (transitionBusyRef.current) return false;
-      transitionBusyRef.current = true;
-      setTransitionBusy(true);
-      const generation = ++sessionLoadGenerationRef.current;
-      updateActiveSessionID(sessionID);
-      setPracticeState(null);
-      if (options.load === false) setMessages([WELCOME_MESSAGE]);
-      try {
-        if (options.load !== false) {
-          await Promise.all([
-            loadSessionMessages(sessionID, generation),
-            refreshPracticeState(sessionID, generation),
-          ]);
-        }
-        return isCurrentSessionLoad(sessionID, generation);
-      } finally {
-        if (generation === sessionLoadGenerationRef.current) {
-          transitionBusyRef.current = false;
-          setTransitionBusy(false);
-        }
-      }
-    },
-    [updateActiveSessionID],
-  );
+  const startSessionTransition = (): number | null => {
+    if (transitionBusyRef.current) return null;
+    transitionBusyRef.current = true;
+    setTransitionBusy(true);
+    return ++sessionLoadGenerationRef.current;
+  };
+
+  const finishSessionTransition = (generation: number) => {
+    if (generation !== sessionLoadGenerationRef.current) return;
+    transitionBusyRef.current = false;
+    setTransitionBusy(false);
+  };
+
+  const loadActiveSession = async (
+    sessionID: string,
+    generation: number,
+    load = true,
+  ) => {
+    updateActiveSessionID(sessionID);
+    setPracticeState(null);
+    if (!load) {
+      setMessages([WELCOME_MESSAGE]);
+      return isCurrentSessionLoad(sessionID, generation);
+    }
+    await Promise.all([
+      loadSessionMessages(sessionID, generation),
+      refreshPracticeState(sessionID, generation),
+    ]);
+    return isCurrentSessionLoad(sessionID, generation);
+  };
+
+  const switchSession = async (sessionID: string, options: { load?: boolean } = {}) => {
+    const generation = startSessionTransition();
+    if (generation == null) return false;
+    try {
+      return await loadActiveSession(sessionID, generation, options.load !== false);
+    } finally {
+      finishSessionTransition(generation);
+    }
+  };
 
   const refreshCoachData = useCallback(
     async (includeGaps = false) => {
@@ -345,7 +359,7 @@ function InterviewWorkspace() {
   }, []);
 
   const handleSelectSession = async (sessionID: string) => {
-    if (isSending || transitionBusyRef.current) return;
+    if (isSending || launchingTaskID || transitionBusyRef.current) return;
     setSessionDrawerOpen(false);
     if (sessionID === activeSessionIDRef.current) return;
     await switchSession(sessionID);
@@ -353,16 +367,19 @@ function InterviewWorkspace() {
 
   const handleCreateSession = async (): Promise<string | null> => {
     if (isSending || transitionBusyRef.current) return null;
+    const generation = startSessionTransition();
+    if (generation == null) return null;
     try {
       const sessionID = await createNewSession();
-      const switched = await switchSession(sessionID, { load: false });
-      if (!switched) return null;
+      if (!(await loadActiveSession(sessionID, generation, false))) return null;
       setSessionDrawerOpen(false);
       await refreshSessions();
       return sessionID;
     } catch {
       setSessionsError("创建会话失败");
       return null;
+    } finally {
+      finishSessionTransition(generation);
     }
   };
 
@@ -487,8 +504,10 @@ function InterviewWorkspace() {
         );
       }
     } finally {
-      if (abortRef.current === controller) abortRef.current = null;
-      setIsSending(false);
+      if (abortRef.current === controller) {
+        abortRef.current = null;
+        setIsSending(false);
+      }
       if (capabilities?.coach === true && options.coachTaskID) {
         void refreshCoachData(profileOpen || activeView === "plan");
         const generation = sessionLoadGenerationRef.current;
@@ -551,10 +570,7 @@ function InterviewWorkspace() {
         )
       );
     }
-    await streamAssistantReply(sessionID, text, clientMessageID, messageId, {
-      ...options,
-      localDate: options.coachTaskID ? localDateKey(new Date()) : options.localDate,
-    });
+    await streamAssistantReply(sessionID, text, clientMessageID, messageId, options);
   };
 
   const handleLaunchCoachTask = async (task: CoachTask) => {
@@ -607,12 +623,6 @@ function InterviewWorkspace() {
     setActiveView("knowledge");
   };
 
-  const practiceMissedQuestion = () => {
-    setProfileOpen(false);
-    setActiveView("practice");
-    void handleSendMessage("我想练习最近一次面试中答漏的问题，请先让我输入原题。");
-  };
-
   // handleStop 用户主动中止正在进行的流式回复。
   const handleStop = () => {
     abortRef.current?.abort();
@@ -637,11 +647,20 @@ function InterviewWorkspace() {
         <ProfileDashboard
           onBack={() => setProfileOpen(false)}
           coachEnabled={capabilities?.coach === true}
+          capabilityLoading={capabilityLoading}
+          capabilityError={capabilityError}
           progress={coachProgress}
           gaps={coachGaps}
+          gapsLoaded={gapsLoaded}
+          gapsLoading={gapsLoading}
+          gapsError={gapsError}
           loading={coachLoading}
           error={coachError}
-          onRetry={() => void refreshCoachData(true)}
+          globalBusy={isSending || transitionBusy || Boolean(launchingTaskID)}
+          onRetry={() => {
+            if (capabilityError) void retryCapabilities();
+            else void refreshCoachData(true);
+          }}
         />
       ) : activeView === "practice" ? (
         <>
@@ -703,9 +722,12 @@ function InterviewWorkspace() {
                       retrieval={message.retrieval}
                       speechEnabled={capabilities?.speech === true}
                       onRetry={
-                        message.failed
+                        message.failed && message.retry?.retryable
                           ? () => handleRetryMessage(message.id)
                           : undefined
+                      }
+                      retryDisabled={
+                        !message.retry?.retryable || isSending || transitionBusy || Boolean(launchingTaskID)
                       }
                     />
                   );
@@ -726,8 +748,9 @@ function InterviewWorkspace() {
             sessionID={activeSessionID}
             onSelectPrompt={handleSelectPracticePrompt}
             realtimeVoiceEnabled={capabilities?.realtime_voice === true}
-            voiceCapabilitiesLoaded={capabilities !== null}
+            voiceCapabilitiesLoaded={!capabilityLoading && capabilities !== null}
             isResponding={isSending}
+            disabled={transitionBusy || Boolean(launchingTaskID)}
             onStop={handleStop}
             onHeightChange={setInputDockHeight}
           />
@@ -738,7 +761,7 @@ function InterviewWorkspace() {
             activeSessionID={activeSessionID}
             loading={sessionsLoading}
             error={sessionsError}
-            busy={isSending}
+            busy={isSending || transitionBusy || Boolean(launchingTaskID)}
             onClose={() => setSessionDrawerOpen(false)}
             onSelect={handleSelectSession}
             onCreate={handleCreateSession}
@@ -752,16 +775,24 @@ function InterviewWorkspace() {
           mode="page"
           onOpenProfile={() => setProfileOpen(true)}
           coachEnabled={capabilities?.coach === true}
+          capabilityLoading={capabilityLoading}
+          capabilityError={capabilityError}
           today={coachToday}
           progress={coachProgress}
           gaps={coachGaps}
+          gapsLoaded={gapsLoaded}
+          gapsLoading={gapsLoading}
+          gapsError={gapsError}
           loading={coachLoading}
           error={coachError}
+          globalBusy={isSending || transitionBusy || Boolean(launchingTaskID)}
           launchingTaskID={launchingTaskID}
-          onRetry={() => void refreshCoachData(true)}
+          onRetry={() => {
+            if (capabilityError) void retryCapabilities();
+            else void refreshCoachData(true);
+          }}
           onLaunchTask={(task) => void handleLaunchCoachTask(task)}
-          onOpenKnowledge={openKnowledgeFromCoach}
-          onPracticeMissedQuestion={practiceMissedQuestion}
+          onEmptyStateAction={openKnowledgeFromCoach}
         />
       ) : (
         <KnowledgeBasePage onOpenProfile={() => setProfileOpen(true)} />

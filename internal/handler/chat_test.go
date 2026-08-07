@@ -495,7 +495,11 @@ func TestChatStreamHandlerMapsTypedCoachErrorsToStableSSEPayload(t *testing.T) {
 				"coach_task_id":"01900000-0000-7000-8000-000000000123"
 			}`)
 			body := recorder.Body.String()
-			if !strings.Contains(body, "event: error") || !strings.Contains(body, fmt.Sprintf(`"code":%d`, tc.code)) || strings.Contains(body, "event: done") {
+			wantRetryable := tc.code == CodeCoachUnavailable
+			if !strings.Contains(body, "event: error") ||
+				!strings.Contains(body, fmt.Sprintf(`"code":%d`, tc.code)) ||
+				!strings.Contains(body, fmt.Sprintf(`"retryable":%t`, wantRetryable)) ||
+				strings.Contains(body, "event: done") {
 				t.Fatalf("body=%q", body)
 			}
 		})

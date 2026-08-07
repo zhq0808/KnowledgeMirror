@@ -28,15 +28,16 @@ test("parses numeric SSE business error code and message", () => {
   assert.equal(frame.message, "教练任务ID与当前练习不匹配");
 });
 
-test("throws typed ChatStreamError for an SSE error frame", async () => {
+test("throws non-retryable typed error for a Coach conflict", async () => {
   await assert.rejects(
     consumeChatSSEStream(
-      streamOf('event: error\ndata: {"code":40911,"message":"必须携带教练任务ID"}\n\n'),
+      streamOf('event: error\ndata: {"code":40911,"message":"必须携带教练任务ID","retryable":false}\n\n'),
       { onDelta() {}, onSources() {} },
     ),
     (error: unknown) =>
       error instanceof ChatStreamError &&
       error.code === 40911 &&
+      !error.retryable &&
       error.message === "必须携带教练任务ID",
   );
 });

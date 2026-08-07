@@ -369,7 +369,8 @@ func coachSSEErrorPayload(err error) string {
 	case errors.Is(err, service.ErrCoachUnavailable):
 		code, message = CodeCoachUnavailable, "教练练习暂时不可用"
 	}
-	payload, marshalErr := json.Marshal(map[string]any{"code": code, "message": message})
+	retryable := code == CodeInternal || code == CodeCoachUnavailable
+	payload, marshalErr := json.Marshal(map[string]any{"code": code, "message": message, "retryable": retryable})
 	if marshalErr != nil {
 		return `{"code":50000,"message":"对话服务暂时不可用"}`
 	}

@@ -124,11 +124,25 @@ export async function listSessionMessages(sessionID: string): Promise<SessionMes
   return body.data ?? [];
 }
 
+const NON_RETRYABLE_CHAT_CODES = new Set([
+  40010,
+  40410,
+  40910,
+  40911,
+  40912,
+  40913,
+  40914,
+]);
+
+export function isChatErrorRetryable(code: number): boolean {
+  return !NON_RETRYABLE_CHAT_CODES.has(code);
+}
+
 export class ChatStreamError extends Error {
   readonly code: number;
   readonly retryable: boolean;
 
-  constructor(message: string, code = -1, retryable = true) {
+  constructor(message: string, code = -1, retryable = isChatErrorRetryable(code)) {
     super(message);
     this.name = "ChatStreamError";
     this.code = code;
@@ -199,10 +213,11 @@ export async function consumeChatSSEStream(
       const frame = parseChatSSEFrame(buffer.slice(0, index));
       buffer = buffer.slice(index + 2);
       if (frame.event === "error") {
+        const code = frame.code ?? -1;
         throw new ChatStreamError(
           frame.message || "对话失败",
-          frame.code ?? -1,
-          frame.retryable ?? true,
+          code,
+          frame.retryable ?? isChatErrorRetryable(code),
         );
       }
       if (frame.event === "done") {

@@ -63,7 +63,7 @@ export function PracticeStatusBar({ state }: PracticeStatusBarProps) {
             </span>
             <div className="min-w-0 flex-1">
               <p className="text-xs leading-relaxed">
-                {prescribed ? "每日教练" : "费曼练习"} · 第 {Math.max(state.round_no, 0) + 1} 轮：{label}
+                {prescribed ? "每日教练" : "费曼练习"} · 第 {prescribed ? Math.max(state.round_no, 1) : Math.max(state.round_no, 0) + 1} 轮：{label}
               </p>
               {question ? (
                 <p className="mt-[2px] break-words text-sm leading-relaxed text-[#5B4636]">

@@ -232,6 +232,7 @@ export function Dashboard({
   const tasks = allTasks.filter((task) => task.date === today?.date);
   const carriedOverTask = today?.active_task?.carried_over ? today.active_task : null;
   const completedTasks = tasks.filter((task) => task.status === "completed");
+  const activeTaskID = today?.active_task?.coach_task_id;
   const emptyAction = today?.empty_state?.action === "review_candidates" && today.empty_state.action_path === "/knowledge";
 
   return (
@@ -319,7 +320,7 @@ export function Dashboard({
               {tasks.length > 0 ? (
                 <div className="space-y-2">
                   {tasks.map((task) => (
-                    <TaskRow key={task.coach_task_id} task={task} launching={launchingTaskID === task.coach_task_id} disabled={globalBusy} onLaunch={() => onLaunchTask(task)} />
+                    <TaskRow key={task.coach_task_id} task={task} launching={launchingTaskID === task.coach_task_id} disabled={globalBusy || Boolean(activeTaskID && activeTaskID !== task.coach_task_id)} onLaunch={() => onLaunchTask(task)} />
                   ))}
                 </div>
               ) : (
