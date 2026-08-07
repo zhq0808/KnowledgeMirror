@@ -29,6 +29,7 @@ func NewPostgresFeynmanPracticeRepository(pool *pgxpool.Pool) *PostgresFeynmanPr
 
 const feynmanPracticeStateSelectSQL = `
 	SELECT session_id, user_id, state, active_question_text, question_origin,
+	       COALESCE(coach_task_id::text, ''), original_question_text, retry_required,
 	       COALESCE(last_answered_message_id::text, ''), last_feedback, round_no, updated_at
 	FROM feynman_practice_states
 	WHERE session_id = $1 AND user_id = $2`
@@ -38,6 +39,7 @@ func (r *PostgresFeynmanPracticeRepository) Load(ctx context.Context, userID, se
 	var state service.FeynmanPracticeState
 	err := r.pool.QueryRow(ctx, feynmanPracticeStateSelectSQL, sessionID, userID).Scan(
 		&state.SessionID, &state.UserID, &state.State, &state.ActiveQuestionText, &state.QuestionOrigin,
+		&state.CoachTaskID, &state.OriginalQuestionText, &state.RetryRequired,
 		&state.LastAnsweredMessageID, &state.LastFeedback, &state.RoundNo, &state.UpdatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -52,12 +54,19 @@ func (r *PostgresFeynmanPracticeRepository) Load(ctx context.Context, userID, se
 const feynmanPracticeStateUpsertSQL = `
 	INSERT INTO feynman_practice_states (
 		session_id, user_id, state, active_question_text, question_origin,
+		coach_task_id, original_question_text, retry_required,
 		last_answered_message_id, last_feedback, round_no
-	) VALUES ($1, $2, $3, $4, $5, NULLIF($6, '')::uuid, $7, $8)
+	) VALUES (
+		$1, $2, $3, $4, $5, NULLIF($6, '')::uuid, $7, $8,
+		NULLIF($9, '')::uuid, $10, $11
+	)
 	ON CONFLICT (session_id) DO UPDATE SET
 		state                    = EXCLUDED.state,
 		active_question_text     = EXCLUDED.active_question_text,
 		question_origin          = EXCLUDED.question_origin,
+		coach_task_id            = EXCLUDED.coach_task_id,
+		original_question_text   = EXCLUDED.original_question_text,
+		retry_required           = EXCLUDED.retry_required,
 		last_answered_message_id = EXCLUDED.last_answered_message_id,
 		last_feedback            = EXCLUDED.last_feedback,
 		round_no                 = EXCLUDED.round_no
@@ -71,6 +80,7 @@ const feynmanPracticeStateUpsertSQL = `
 func (r *PostgresFeynmanPracticeRepository) Save(ctx context.Context, state service.FeynmanPracticeState) error {
 	tag, err := r.pool.Exec(ctx, feynmanPracticeStateUpsertSQL,
 		state.SessionID, state.UserID, state.State, state.ActiveQuestionText, state.QuestionOrigin,
+		state.CoachTaskID, state.OriginalQuestionText, state.RetryRequired,
 		state.LastAnsweredMessageID, state.LastFeedback, state.RoundNo,
 	)
 	if err != nil {

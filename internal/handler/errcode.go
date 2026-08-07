@@ -11,6 +11,15 @@ const (
 	CodeMethodNA     = 40500 // 方法不允许
 	CodeConflict     = 40900 // 幂等键冲突或资源状态冲突
 
+	CodeCoachTaskNotFound      = 40410
+	CodeCoachTaskNotStartable  = 40910
+	CodeCoachTaskIDRequired    = 40911
+	CodeCoachTaskMismatch      = 40912
+	CodeCoachAttemptConflict   = 40913
+	CodeCoachCorrectionPending = 40914
+	CodeCoachAnalysisInput     = 40010
+	CodeCoachUnavailable       = 50310
+
 	CodeInternal = 50000 // 内部错误
 	CodeUpstream = 50200 // 上游（大模型）不可用
 )

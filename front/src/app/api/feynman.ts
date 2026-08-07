@@ -38,12 +38,16 @@ export type FeynmanPracticeStateName =
   | "awaiting_answer"
   | "analyzing_answer"
   | "awaiting_follow_up"
+  | "awaiting_retry"
   | "queue_paused";
 
 export interface FeynmanPracticeState {
   state: FeynmanPracticeStateName;
   question: string;
   round_no: number;
+  coach_task_id: string;
+  original_question: string;
+  retry_required: boolean;
 }
 
 export function getFeynmanPracticeState(sessionID: string): Promise<FeynmanPracticeState> {

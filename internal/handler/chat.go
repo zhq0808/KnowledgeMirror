@@ -21,6 +21,8 @@ type chatRequest struct {
 	SessionID       string `json:"session_id"`
 	ClientMessageID string `json:"client_message_id"`
 	Message         string `json:"message"`
+	CoachTaskID     string `json:"coach_task_id"`
+	LocalDate       string `json:"local_date"`
 	// VoiceCaptureID 可选：这条消息是哪段录音转写来的。
 	// 它只用于把原始转写和用户实际发出的文本关联起来，
 	// 不影响任何对话逻辑：语音和打字到了这里已经是同一件东西。
@@ -95,6 +97,25 @@ func (s *Server) chatStreamHandler(c *gin.Context) {
 	if req.VoiceCaptureID != "" && !uuidPattern.MatchString(req.VoiceCaptureID) {
 		fail(c, http.StatusBadRequest, CodeBadRequest, "语音记录ID格式错误")
 		return
+	}
+	req.CoachTaskID = strings.TrimSpace(req.CoachTaskID)
+	if req.CoachTaskID != "" && !uuidPattern.MatchString(req.CoachTaskID) {
+		fail(c, http.StatusBadRequest, CodeBadRequest, "教练任务ID格式错误")
+		return
+	}
+	req.LocalDate = strings.TrimSpace(req.LocalDate)
+	if req.LocalDate != "" {
+		now := time.Now()
+		parsed, err := time.ParseInLocation(time.DateOnly, req.LocalDate, now.Location())
+		if err != nil || parsed.Format(time.DateOnly) != req.LocalDate {
+			fail(c, http.StatusBadRequest, CodeBadRequest, "本地日期必须是 YYYY-MM-DD")
+			return
+		}
+		serverDate := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+		if parsed.Before(serverDate.AddDate(0, 0, -1)) || parsed.After(serverDate.AddDate(0, 0, 1)) {
+			fail(c, http.StatusBadRequest, CodeBadRequest, "本地日期只能是服务端当前日期前后一天")
+			return
+		}
 	}
 	userID, ok := UserIDFromContext(c.Request.Context())
 	if !ok {
@@ -300,6 +321,8 @@ func (s *Server) chatStreamHandler(c *gin.Context) {
 		History:       history,
 		Message:       strings.TrimSpace(req.Message),
 		UserMessageID: leaseResult.UserMessage.MessageID,
+		CoachTaskID:   req.CoachTaskID,
+		LocalDate:     req.LocalDate,
 		OnRetrieval:   sendSources,
 		OnDelta:       sendDelta,
 	})
@@ -318,12 +341,39 @@ func (s *Server) chatStreamHandler(c *gin.Context) {
 			"message_id", leaseResult.UserMessage.MessageID,
 			"error", err,
 		)
-		// 已经开始流（header 无法再改成 500），用 error 事件通知前端。
-		_ = writeSSE("error", `{"message":"对话服务暂时不可用"}`)
+		// 已经开始流，Coach 业务错误使用稳定 SSE code；HTTP 状态已无法改变。
+		_ = writeSSE("error", coachSSEErrorPayload(err))
 		return
 	}
 
 	persistAndFinish(assistantContent)
+}
+
+func coachSSEErrorPayload(err error) string {
+	code, message := CodeInternal, "对话服务暂时不可用"
+	switch {
+	case errors.Is(err, service.ErrCoachTaskNotFound):
+		code, message = CodeCoachTaskNotFound, "教练任务不存在"
+	case errors.Is(err, service.ErrCoachTaskNotStartable):
+		code, message = CodeCoachTaskNotStartable, "教练任务当前不可开始"
+	case errors.Is(err, service.ErrCoachTaskIDRequired):
+		code, message = CodeCoachTaskIDRequired, "当前教练练习必须携带教练任务ID"
+	case errors.Is(err, service.ErrCoachTaskMismatch):
+		code, message = CodeCoachTaskMismatch, "教练任务ID与当前练习不匹配"
+	case errors.Is(err, service.ErrCoachAttemptConflict):
+		code, message = CodeCoachAttemptConflict, "该回答已提交过教练分析"
+	case errors.Is(err, service.ErrCoachCorrectionPending):
+		code, message = CodeCoachCorrectionPending, "复测失败后必须先完成即时纠正"
+	case errors.Is(err, service.ErrCoachAnalysisInput):
+		code, message = CodeCoachAnalysisInput, "教练分析输入无效"
+	case errors.Is(err, service.ErrCoachUnavailable):
+		code, message = CodeCoachUnavailable, "教练练习暂时不可用"
+	}
+	payload, marshalErr := json.Marshal(map[string]any{"code": code, "message": message})
+	if marshalErr != nil {
+		return `{"code":50000,"message":"对话服务暂时不可用"}`
+	}
+	return string(payload)
 }
 
 // replayCompletedTurn 处理"结果恢复协议"里的回放场景：同一条用户消息对应的 turn 之前已经

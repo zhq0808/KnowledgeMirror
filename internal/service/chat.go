@@ -74,6 +74,8 @@ type ChatStreamRequest struct {
 	// 避免重复调用模型并把状态多推进一轮。
 	Message       string
 	UserMessageID string
+	CoachTaskID   string
+	LocalDate     string
 	// OnRetrieval 在模型调用前被调一次，供接口层先下发引用来源；可为 nil。
 	OnRetrieval func(result RetrievalResult) error
 	OnDelta     func(delta string) error

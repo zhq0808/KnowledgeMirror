@@ -7,6 +7,7 @@ interface APIResponse<T> {
 export interface ApplicationCapabilities {
   realtime_voice: boolean;
   speech: boolean;
+  coach: boolean;
 }
 
 export async function getApplicationCapabilities(): Promise<ApplicationCapabilities> {

@@ -25,13 +25,15 @@ const (
 	FeynmanStateAwaitingAnswer   = "awaiting_answer"
 	FeynmanStateAnalyzingAnswer  = "analyzing_answer"
 	FeynmanStateAwaitingFollowUp = "awaiting_follow_up"
+	FeynmanStateAwaitingRetry    = "awaiting_retry"
 	FeynmanStatePaused           = "queue_paused"
 )
 
-// 题目来源：用户自述主题 or AI 上一轮的追问。
+// 题目来源：用户自述主题、AI 上一轮追问或每日教练处方。
 const (
 	FeynmanQuestionOriginUserTopic  = "user_topic"
 	FeynmanQuestionOriginFollowUp   = "ai_follow_up"
+	FeynmanQuestionOriginCoachTask  = "coach_task"
 	feynmanEntryMessage             = "我想开始费曼学习练习"
 	defaultMaxControlPhraseRunes    = 16
 	defaultMaxFeynmanTopicRunes     = 120
@@ -160,7 +162,7 @@ func resolveFeynmanIntent(state, message string, maxControlPhraseRunes, maxTopic
 			return feynmanIntent{Kind: feynmanIntentStartTopic, Topic: topic}
 		}
 		return feynmanIntent{Kind: feynmanIntentNone}
-	case FeynmanStateAwaitingAnswer, FeynmanStateAnalyzingAnswer:
+	case FeynmanStateAwaitingAnswer, FeynmanStateAwaitingRetry, FeynmanStateAnalyzingAnswer:
 		return feynmanIntent{Kind: feynmanIntentAnswer}
 	case FeynmanStateAwaitingFollowUp:
 		// 已经给过反馈：用户如果显式换主题就换，否则当作对上一题的补充讲解。

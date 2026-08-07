@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -40,6 +41,9 @@ type FeynmanPracticeState struct {
 	State                 string
 	ActiveQuestionText    string
 	QuestionOrigin        string
+	CoachTaskID           string
+	OriginalQuestionText  string
+	RetryRequired         bool
 	LastAnsweredMessageID string
 	LastFeedback          string
 	RoundNo               int
@@ -98,20 +102,25 @@ type FeynmanDialogService struct {
 	repo      FeynmanPracticeRepository
 	analyzer  FeynmanAnswerAnalyzer
 	retriever ChatRetriever
+	coach     CoachRepository
 	limits    FeynmanDialogLimits
 	log       *slog.Logger
 }
 
 // NewFeynmanDialogService 构造对话式费曼服务。retriever 可为 nil（此时分析不带资料，
 // 但上下文里会有明确的“未启用检索”占位，模型不会因此编造引用）。
-func NewFeynmanDialogService(repo FeynmanPracticeRepository, analyzer FeynmanAnswerAnalyzer, retriever ChatRetriever, limits FeynmanDialogLimits, log *slog.Logger) *FeynmanDialogService {
-	return &FeynmanDialogService{
+func NewFeynmanDialogService(repo FeynmanPracticeRepository, analyzer FeynmanAnswerAnalyzer, retriever ChatRetriever, limits FeynmanDialogLimits, log *slog.Logger, coach ...CoachRepository) *FeynmanDialogService {
+	service := &FeynmanDialogService{
 		repo:      repo,
 		analyzer:  analyzer,
 		retriever: retriever,
 		limits:    limits.withDefaults(),
 		log:       log,
 	}
+	if len(coach) > 0 {
+		service.coach = coach[0]
+	}
+	return service
 }
 
 // State 返回会话当前练习状态，供接口层做状态条展示；无记录时返回 idle。
@@ -126,6 +135,26 @@ func (s *FeynmanDialogService) State(ctx context.Context, userID, sessionID stri
 	return state, nil
 }
 
+func (s *FeynmanDialogService) startCoachTask(ctx context.Context, request ChatStreamRequest) (bool, string, error) {
+	if s.coach == nil {
+		return false, "", ErrCoachUnavailable
+	}
+	reply := ""
+	task, err := s.coach.GetTask(ctx, request.UserID, request.CoachTaskID)
+	if err != nil {
+		return false, "", err
+	}
+	reply = "每日教练题：" + task.QuestionText
+	task, err = s.coach.StartTaskInSession(ctx, StartCoachTaskParams{
+		UserID: request.UserID, CoachTaskID: request.CoachTaskID, SessionID: request.SessionID,
+		UserMessageID: request.UserMessageID, Reply: reply,
+	})
+	if err != nil {
+		return false, "", err
+	}
+	return true, reply, s.emit(request, reply)
+}
+
 // Handle 实现 ChatPracticeRouter：返回 handled=false 表示这条消息不归费曼管，
 // 调用方继续走自由对话。任何内部故障都降级为“不介入”，绝不把用户困在状态机里。
 func (s *FeynmanDialogService) Handle(ctx context.Context, request ChatStreamRequest) (bool, string, error) {
@@ -136,8 +165,11 @@ func (s *FeynmanDialogService) Handle(ctx context.Context, request ChatStreamReq
 
 	state, found, err := s.repo.Load(ctx, request.UserID, request.SessionID)
 	if err != nil {
-		s.log.Error("读取费曼练习状态失败，本轮降级为普通对话",
+		s.log.Error("读取费曼练习状态失败",
 			"trace_id", request.TraceID, "session_id", request.SessionID, "error", err)
+		if request.CoachTaskID != "" {
+			return false, "", fmt.Errorf("%w: %v", ErrCoachUnavailable, err)
+		}
 		return false, "", nil
 	}
 	if !found {
@@ -153,16 +185,32 @@ func (s *FeynmanDialogService) Handle(ctx context.Context, request ChatStreamReq
 			"trace_id", request.TraceID, "session_id", request.SessionID)
 		if strings.TrimSpace(state.ActiveQuestionText) == "" {
 			state.State = FeynmanStateAwaitingTopic
+		} else if state.QuestionOrigin == FeynmanQuestionOriginCoachTask && state.RetryRequired {
+			state.State = FeynmanStateAwaitingRetry
 		} else {
 			state.State = FeynmanStateAwaitingAnswer
 		}
 	}
 
-	// 结果恢复协议：同一条用户消息重试（assistant 落库失败后前端复用 client_message_id）
-	// 时直接回放上次反馈，不重复调用模型，也不重复推进状态。
+	// 结果恢复协议必须先于启动裁决：assistant 落库失败后的同消息重试只回放，
+	// 不能再次 StartTask 或重新分析。
 	if request.UserMessageID != "" && request.UserMessageID == state.LastAnsweredMessageID &&
 		strings.TrimSpace(state.LastFeedback) != "" {
 		return true, state.LastFeedback, s.emit(request, state.LastFeedback)
+	}
+
+	if state.QuestionOrigin == FeynmanQuestionOriginCoachTask {
+		if request.CoachTaskID == "" {
+			if state.State == FeynmanStatePaused {
+				return false, "", nil
+			}
+			return false, "", ErrCoachTaskIDRequired
+		}
+		if request.CoachTaskID != state.CoachTaskID {
+			return false, "", ErrCoachTaskMismatch
+		}
+	} else if request.CoachTaskID != "" {
+		return s.startCoachTask(ctx, request)
 	}
 
 	intent := resolveFeynmanIntent(state.State, message, s.limits.MaxControlPhraseRunes, s.limits.MaxTopicRunes)
@@ -171,12 +219,59 @@ func (s *FeynmanDialogService) Handle(ctx context.Context, request ChatStreamReq
 		return false, "", nil
 	}
 	if decision.Analyze {
+		if state.QuestionOrigin == FeynmanQuestionOriginCoachTask {
+			if _, err := coachAnswerLocalDate(request.LocalDate, time.Now()); err != nil {
+				return false, "", err
+			}
+		}
 		return s.analyze(ctx, request, decision.Next, message)
+	}
+	if state.QuestionOrigin == FeynmanQuestionOriginCoachTask {
+		return s.controlCoachTask(ctx, request, state, decision, intent)
 	}
 	if err := s.repo.Save(ctx, decision.Next); err != nil {
 		s.log.Error("保存费曼练习状态失败，本轮降级为普通对话",
 			"trace_id", request.TraceID, "session_id", request.SessionID, "error", err)
 		return false, "", nil
+	}
+	return true, decision.Reply, s.emit(request, decision.Reply)
+}
+
+func (s *FeynmanDialogService) controlCoachTask(ctx context.Context, request ChatStreamRequest, current FeynmanPracticeState, decision feynmanDecision, intent feynmanIntent) (bool, string, error) {
+	if s.coach == nil {
+		return false, "", nil
+	}
+	action := ""
+	switch intent.Kind {
+	case feynmanIntentPause:
+		action = "pause"
+		decision.Next = current
+		decision.Next.State = FeynmanStatePaused
+	case feynmanIntentResume, feynmanIntentRetry:
+		action = "resume"
+		decision.Next = current
+		if current.RetryRequired {
+			decision.Next.State = FeynmanStateAwaitingRetry
+		} else {
+			decision.Next.State = FeynmanStateAwaitingAnswer
+		}
+		decision.Reply = fmt.Sprintf(feynmanCopyResumed, current.OriginalQuestionText)
+	case feynmanIntentSkip:
+		action = "skip"
+		decision.Next = idleFeynmanState(current)
+	case feynmanIntentStop:
+		action = "stop"
+		decision.Next = idleFeynmanState(current)
+	default:
+		return false, "", nil
+	}
+	decision.Next.LastAnsweredMessageID = request.UserMessageID
+	decision.Next.LastFeedback = decision.Reply
+	if err := s.coach.ControlTask(ctx, CoachTaskControlParams{
+		UserID: request.UserID, SessionID: request.SessionID, CoachTaskID: current.CoachTaskID,
+		Action: action, UserMessageID: request.UserMessageID, Reply: decision.Reply, PracticeState: decision.Next,
+	}); err != nil {
+		return false, "", err
 	}
 	return true, decision.Reply, s.emit(request, decision.Reply)
 }
@@ -188,15 +283,17 @@ func (s *FeynmanDialogService) analyze(ctx context.Context, request ChatStreamRe
 	}
 	question := state.ActiveQuestionText
 
-	// 先把 analyzing_answer 落库再调用模型：这样即使进程中断，下一条消息也能看到
-	// “上一轮死在分析里”，而不是把中断当成什么都没发生。
-	state.State = FeynmanStateAnalyzingAnswer
-	state.LastAnsweredMessageID = request.UserMessageID
-	state.LastFeedback = ""
-	if err := s.repo.Save(ctx, state); err != nil {
-		s.log.Error("保存费曼分析中状态失败，本轮降级为普通对话",
-			"trace_id", request.TraceID, "session_id", request.SessionID, "error", err)
-		return false, "", nil
+	// 自由费曼保留 analyzing_answer 崩溃恢复投影；Coach 必须等待分析后由
+	// CommitAnalysis 原子写 attempt/gaps/task/practice，模型错误时数据库仍停在原等待态。
+	if state.QuestionOrigin != FeynmanQuestionOriginCoachTask {
+		state.State = FeynmanStateAnalyzingAnswer
+		state.LastAnsweredMessageID = request.UserMessageID
+		state.LastFeedback = ""
+		if err := s.repo.Save(ctx, state); err != nil {
+			s.log.Error("保存费曼分析中状态失败，本轮降级为普通对话",
+				"trace_id", request.TraceID, "session_id", request.SessionID, "error", err)
+			return false, "", nil
+		}
 	}
 
 	answer = truncateRunes(answer, s.limits.MaxAnswerRunes)
@@ -213,12 +310,17 @@ func (s *FeynmanDialogService) analyze(ctx context.Context, request ChatStreamRe
 	if err != nil {
 		s.log.Error("费曼回答分析失败",
 			"trace_id", request.TraceID, "session_id", request.SessionID, "error", err)
-		s.rollbackAnalysis(ctx, request, state)
+		if state.QuestionOrigin != FeynmanQuestionOriginCoachTask {
+			s.rollbackAnalysis(ctx, request, state)
+		}
 		reply := fmt.Sprintf(feynmanCopyAnalysisFailed, classifyFeynmanAnalysisError(err))
 		return true, reply, s.emit(request, reply)
 	}
 
 	result = sanitizeAnswerAnalysis(result, answer, dimensions, s.limits)
+	if state.QuestionOrigin == FeynmanQuestionOriginCoachTask {
+		return s.commitCoachAnalysis(ctx, request, state, result)
+	}
 	feedback := renderFeynmanFeedback(result, s.limits)
 
 	next := state
@@ -241,10 +343,222 @@ func (s *FeynmanDialogService) analyze(ctx context.Context, request ChatStreamRe
 	return true, feedback, s.emit(request, feedback)
 }
 
+func coachAnswerLocalDate(value string, now time.Time) (time.Time, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}, fmt.Errorf("%w: 活动教练回答缺少 local_date", ErrCoachAnalysisInput)
+	}
+	date, err := time.ParseInLocation(time.DateOnly, value, now.Location())
+	if err != nil || date.Format(time.DateOnly) != value {
+		return time.Time{}, fmt.Errorf("%w: local_date 必须是 YYYY-MM-DD", ErrCoachAnalysisInput)
+	}
+	today := localDate(now)
+	if daysBetween(today, date) < -1 || daysBetween(today, date) > 1 {
+		return time.Time{}, fmt.Errorf("%w: local_date 只能是服务端当前日期前后一天", ErrCoachAnalysisInput)
+	}
+	return date, nil
+}
+
+func (s *FeynmanDialogService) commitCoachAnalysis(ctx context.Context, request ChatStreamRequest, state FeynmanPracticeState, result AnswerAnalysisResult) (bool, string, error) {
+	if s.coach == nil {
+		return false, "", nil
+	}
+	task, err := s.coach.GetTask(ctx, request.UserID, state.CoachTaskID)
+	if err != nil {
+		return false, "", err
+	}
+	answerDate, err := coachAnswerLocalDate(request.LocalDate, time.Now())
+	if err != nil {
+		return false, "", err
+	}
+	gaps, blockers, focus, err := buildCoachGaps(result.Gaps, task, s.coach, ctx)
+	if err != nil {
+		return false, "", err
+	}
+	outcome := CoachAttemptOutcomePassed
+	next := idleFeynmanState(state)
+	feedback := "这次回答通过。"
+	if len(blockers) > 0 {
+		outcome = CoachAttemptOutcomeRetryRequired
+		next = state
+		next.State = FeynmanStateAwaitingRetry
+		next.ActiveQuestionText = state.OriginalQuestionText
+		next.RetryRequired = true
+		feedback = renderCoachStrictFeedback(focus, state.OriginalQuestionText)
+	} else if task.SourceReviewID != "" && task.SourceGapID != "" {
+		feedback = "本次复测通过。"
+	}
+	next.LastAnsweredMessageID = request.UserMessageID
+	next.LastFeedback = feedback
+	next.RoundNo++
+	analysisJSON, _ := json.Marshal(map[string]any{
+		"classifier_version": "coach-gap-classifier-v1",
+		"sanitized_result":   result,
+		"focus_gap_key":      focus.GapKey,
+	})
+	attemptID, err := NewCoachAttemptID()
+	if err != nil {
+		return false, "", err
+	}
+	reviewDecision := DecideCoachReviewLifecycle(task, gaps)
+	if state.RetryRequired {
+		// The source review was already finalized by the unaided retest answer.
+		// This turn only corrects persisted pending gaps and must not re-decide it.
+		reviewDecision.TargetRecurred = false
+		reviewDecision.CurrentReviewStatus = FeynmanGapReviewStatusPassed
+	}
+	_, err = s.coach.CommitAnalysis(ctx, CommitCoachAnalysisParams{
+		Attempt: CoachAttempt{CoachAttemptID: attemptID, CoachTaskID: state.CoachTaskID, UserID: request.UserID,
+			SessionID: request.SessionID, AnswerMessageID: request.UserMessageID, OriginalQuestionText: state.OriginalQuestionText,
+			AnalysisJSON: analysisJSON, Outcome: outcome, PromptVersion: s.analyzer.PromptVersion(), ModelName: s.analyzer.ModelName()},
+		Gaps: gaps, ReviewDecision: reviewDecision, PracticeState: next, CompletedAt: time.Now(),
+		CorrectionDate: answerDate,
+	})
+	if err != nil {
+		return false, "", err
+	}
+	return true, feedback, s.emit(request, feedback)
+}
+
+func buildCoachGaps(raw []AnswerAnalysisGap, task CoachDailyTask, repo CoachRepository, ctx context.Context) ([]CoachGapEvidence, []int, CoachGapEvidence, error) {
+	keys := make([]string, len(raw))
+	for i, gap := range raw {
+		keys[i] = coachGapKey(gap)
+	}
+	prior, err := repo.FetchPriorGapEvidence(ctx, task.UserID, keys)
+	if err != nil {
+		return nil, nil, CoachGapEvidence{}, err
+	}
+	var sourceGap FeynmanGap
+	if task.SourceGapID != "" {
+		sourceGap, err = repo.GetGap(ctx, task.UserID, task.SourceGapID)
+		if err != nil {
+			return nil, nil, CoachGapEvidence{}, err
+		}
+	}
+	gaps := make([]CoachGapEvidence, 0, len(raw))
+	blockers := make([]int, 0, len(raw))
+	for _, gap := range raw {
+		gapType := classifyCoachWeakness(gap, prior[coachGapKey(gap)])
+		forceGapID := ""
+		// A retest target recurs only when the sanitized gap matches the exact source
+		// gap identity (same normalized key or same dimension/title), never merely
+		// because it appears first in model output.
+		if task.SourceGapID != "" && (coachGapKey(gap) == sourceGap.GapKey ||
+			(gap.Dimension == sourceGap.DiagnosticDimension && feynmanGapLabel(gap) == sourceGap.Title)) {
+			gapType = CoachGapTypeRecall
+			forceGapID = task.SourceGapID
+		}
+		attemptGapID, err := NewCoachAttemptGapID()
+		if err != nil {
+			return nil, nil, CoachGapEvidence{}, err
+		}
+		tempID, err := NewFeynmanGapID()
+		if err != nil {
+			return nil, nil, CoachGapEvidence{}, err
+		}
+		evidence, _ := json.Marshal(map[string]string{"verdict": gap.Verdict, "quote": gap.UserQuote})
+		blocking := isCoachBlockingGap(gap)
+		entry := CoachGapEvidence{AttemptGapID: attemptGapID, ForceCanonicalGapID: forceGapID, GapID: tempID,
+			GapKey: coachGapKey(gap), GapType: gapType, DiagnosticDimension: gap.Dimension,
+			Title: feynmanGapLabel(gap), Description: gap.Analysis, Severity: coachGapPriority(gap),
+			RequiresCorrection: blocking, EvidenceJSON: evidence}
+		gaps = append(gaps, entry)
+		if blocking {
+			blockers = append(blockers, len(gaps)-1)
+		}
+	}
+	focusIndex := selectCoachFocus(gaps, raw, blockers)
+	var focus CoachGapEvidence
+	if focusIndex >= 0 {
+		gaps[focusIndex].IsFocus = true
+		focus = gaps[focusIndex]
+	}
+	return gaps, blockers, focus, nil
+}
+
+func coachGapKey(gap AnswerAnalysisGap) string {
+	key, _ := NormalizeCoachGapKey(gap.Dimension + "-" + feynmanGapLabel(gap))
+	return key
+}
+
+func classifyCoachWeakness(gap AnswerAnalysisGap, prior PriorGapEvidence) string {
+	switch gap.Dimension {
+	case FeynmanDimensionExpression:
+		return CoachGapTypeExpression
+	case FeynmanDimensionProjectMapping:
+		return CoachGapTypeProjectEvidence
+	}
+	if prior.GapID != "" && prior.Status == FeynmanGapStatusResolved {
+		return CoachGapTypeRecall
+	}
+	return CoachGapTypeKnowledge
+}
+
+func isCoachBlockingGap(gap AnswerAnalysisGap) bool {
+	if gap.Verdict == FeynmanGapVerdictIncorrect {
+		return true
+	}
+	if gap.Dimension == FeynmanDimensionExpression || gap.Dimension == FeynmanDimensionProjectMapping {
+		return true
+	}
+	return gap.Verdict == FeynmanGapVerdictOmitted &&
+		(gap.Dimension == FeynmanDimensionKeyPoints || gap.Dimension == FeynmanDimensionCausalChain || gap.Dimension == FeynmanDimensionFactBoundary)
+}
+
+func coachGapPriority(gap AnswerAnalysisGap) int {
+	if gap.Verdict == FeynmanGapVerdictIncorrect && (gap.Dimension == FeynmanDimensionFactBoundary || gap.Dimension == FeynmanDimensionCausalChain) {
+		return 5
+	}
+	if gap.Dimension == FeynmanDimensionKeyPoints && gap.Verdict == FeynmanGapVerdictOmitted {
+		return 4
+	}
+	if gap.Dimension == FeynmanDimensionProjectMapping {
+		return 3
+	}
+	if gap.Dimension == FeynmanDimensionExpression {
+		return 1
+	}
+	return 2
+}
+
+func selectCoachFocus(gaps []CoachGapEvidence, raw []AnswerAnalysisGap, blockers []int) int {
+	best := -1
+	bestScore := -1
+	for _, index := range blockers {
+		score := coachGapPriority(raw[index])
+		// A retest target recurring is the source recall failure and wins focus.
+		if gaps[index].ForceCanonicalGapID != "" {
+			score = 100
+		}
+		// Stable tie-break: keep the analyzer's sanitized order.
+		if score > bestScore {
+			best, bestScore = index, score
+		}
+	}
+	return best
+}
+
+func renderCoachStrictFeedback(focus CoachGapEvidence, question string) string {
+	var b strings.Builder
+	b.WriteString("本轮重点：【" + focus.GapType + "】" + focus.Title + "\n")
+	var evidence map[string]string
+	_ = json.Unmarshal(focus.EvidenceJSON, &evidence)
+	if evidence["quote"] != "" {
+		b.WriteString("你的原话：“" + evidence["quote"] + "”\n")
+	}
+	b.WriteString("纠正：" + focus.Description + "\n\n现在重新完整回答原题：" + question)
+	return b.String()
+}
+
 // rollbackAnalysis 把状态退回“等待这道题的回答”，题目保留，方便用户直接重讲。
 func (s *FeynmanDialogService) rollbackAnalysis(ctx context.Context, request ChatStreamRequest, state FeynmanPracticeState) {
 	rollback := state
-	rollback.State = FeynmanStateAwaitingAnswer
+	if state.QuestionOrigin == FeynmanQuestionOriginCoachTask && state.RetryRequired {
+		rollback.State = FeynmanStateAwaitingRetry
+	} else {
+		rollback.State = FeynmanStateAwaitingAnswer
+	}
 	rollback.LastAnsweredMessageID = ""
 	rollback.LastFeedback = ""
 	// 分析失败常常伴随 ctx 超时/取消，回滚必须用不受其影响的上下文，否则状态会卡在 analyzing。
@@ -394,7 +708,7 @@ func decideFeynmanTransition(current FeynmanPracticeState, intent feynmanIntent,
 		}
 		return notHandled
 
-	case FeynmanStateAwaitingAnswer, FeynmanStateAnalyzingAnswer:
+	case FeynmanStateAwaitingAnswer, FeynmanStateAwaitingRetry, FeynmanStateAnalyzingAnswer:
 		switch intent.Kind {
 		case feynmanIntentAnswer:
 			if !hasQuestion {
@@ -463,7 +777,11 @@ func decideFeynmanTransition(current FeynmanPracticeState, intent feynmanIntent,
 				return feynmanDecision{Handled: true, Reply: feynmanCopyAskTopic, Next: next}
 			}
 			next := current
-			next.State = FeynmanStateAwaitingAnswer
+			if current.QuestionOrigin == FeynmanQuestionOriginCoachTask && current.RetryRequired {
+				next.State = FeynmanStateAwaitingRetry
+			} else {
+				next.State = FeynmanStateAwaitingAnswer
+			}
 			return feynmanDecision{Handled: true, Reply: fmt.Sprintf(feynmanCopyResumed, current.ActiveQuestionText), Next: next}
 		case feynmanIntentPause:
 			return feynmanDecision{Handled: true, Reply: feynmanCopyPaused, Next: current}

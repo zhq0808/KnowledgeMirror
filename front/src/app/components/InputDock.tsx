@@ -19,6 +19,7 @@ interface InputDockProps {
   realtimeVoiceEnabled?: boolean;
   voiceCapabilitiesLoaded?: boolean;
   isResponding: boolean;
+  disabled?: boolean;
   onStop: () => void;
   onHeightChange?: (height: number) => void;
 }
@@ -30,6 +31,7 @@ export function InputDock({
   realtimeVoiceEnabled = false,
   voiceCapabilitiesLoaded = false,
   isResponding,
+  disabled = false,
   onStop,
   onHeightChange,
 }: InputDockProps) {
@@ -74,7 +76,7 @@ export function InputDock({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!voiceBusy && input.trim()) submitText(input.trim());
+    if (!disabled && !voiceBusy && input.trim()) submitText(input.trim());
   };
 
   const stopRealtime = () => {
@@ -82,7 +84,7 @@ export function InputDock({
   };
 
   const startRealtime = () => {
-    if (!sessionID || !realtimeVoiceEnabled || voiceBusy) return;
+    if (disabled || !sessionID || !realtimeVoiceEnabled || voiceBusy) return;
     realtime.start(sessionID, input);
   };
 
@@ -95,7 +97,7 @@ export function InputDock({
     realtime.status === "connecting" ||
     realtime.status === "ready" ||
     realtime.status === "streaming";
-  const micDisabled = !voiceCapabilitiesLoaded || !realtimeVoiceEnabled || !sessionID || realtime.status === "stopping";
+  const micDisabled = disabled || !voiceCapabilitiesLoaded || !realtimeVoiceEnabled || !sessionID || realtime.status === "stopping";
   const micTitle =
     canStopRealtime
       ? "停止听写"
@@ -137,7 +139,8 @@ export function InputDock({
               key={p.label}
               type="button"
               onClick={() => onSelectPrompt(p)}
-              className="flex-shrink-0 flex items-center gap-1.5 rounded-full bg-white px-3.5 py-2 text-xs text-gray-600 shadow-[0_2px_12px_rgba(0,0,0,0.05)] transition-colors hover:bg-gray-50 active:bg-gray-100"
+              disabled={disabled}
+              className="flex-shrink-0 flex items-center gap-1.5 rounded-full bg-white px-3.5 py-2 text-xs text-gray-600 shadow-[0_2px_12px_rgba(0,0,0,0.05)] transition-colors hover:bg-gray-50 active:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-50"
             >
               <span>{p.emoji}</span>
               <span>{p.label}</span>
@@ -191,13 +194,13 @@ export function InputDock({
             type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            readOnly={voiceBusy}
-            aria-readonly={voiceBusy}
+            readOnly={voiceBusy || disabled}
+            aria-readonly={voiceBusy || disabled}
             placeholder="输入想练习的知识点或面试问题..."
             className="w-full bg-white rounded-full px-5 py-3.5 pr-12 shadow-[0_2px_20px_rgba(0,0,0,0.06)] focus:outline-none focus:ring-2 focus:ring-[#A8D5BA]/30 transition-shadow text-sm read-only:cursor-default"
           />
           <AnimatePresence>
-            {input && !voiceBusy && (
+            {input && !voiceBusy && !disabled && (
               <motion.button
                 type="submit"
                 initial={{ opacity: 0, scale: 0.7 }}

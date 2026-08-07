@@ -14,13 +14,14 @@ interface AIMessageProps {
   onRetry?: () => void;
   retrieval?: RetrievalSources;
   speechEnabled?: boolean;
+  retryDisabled?: boolean;
 }
 
 // AIMessage 渲染助手回复。回复内容可能包含 markdown（加粗、有序/无序列表、链接等），
 // 用 react-markdown + remark-gfm 渲染，并通过 arbitrary variant 给嵌套元素补样式，
 // 避免额外引入 typography 插件。
 // 当内容为空（回复尚未吐字）时，显示三个主题绿色的跳动圆点作为“正在输入”指示。
-export function AIMessage({ message, time, failed, onRetry, retrieval, speechEnabled = false }: AIMessageProps) {
+export function AIMessage({ message, time, failed, onRetry, retrieval, speechEnabled = false, retryDisabled = false }: AIMessageProps) {
   const isTyping = message.trim().length === 0;
   const speech = useSpeechPlayback();
 
@@ -110,7 +111,8 @@ export function AIMessage({ message, time, failed, onRetry, retrieval, speechEna
         <button
           type="button"
           onClick={onRetry}
-          className="mt-1.5 flex items-center gap-1 rounded-lg px-1 text-[12px] text-primary hover:underline"
+          disabled={retryDisabled}
+          className="mt-1.5 flex items-center gap-1 rounded-lg px-1 text-[12px] text-primary hover:underline disabled:cursor-not-allowed disabled:opacity-50"
         >
           <RotateCcw size={12} />
           重试

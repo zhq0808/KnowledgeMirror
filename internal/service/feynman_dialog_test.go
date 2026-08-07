@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 )
 
 func discardLogger() *slog.Logger {
@@ -54,6 +55,77 @@ func (r *fakeFeynmanPracticeRepo) lastSave(t *testing.T) FeynmanPracticeState {
 	return r.saves[len(r.saves)-1]
 }
 
+type fakeCoachRepository struct {
+	task       CoachDailyTask
+	startErr   error
+	startCalls int
+	starts     []StartCoachTaskParams
+	control    []CoachTaskControlParams
+	commits    []CommitCoachAnalysisParams
+	prior      map[string]PriorGapEvidence
+	practice   *fakeFeynmanPracticeRepo
+}
+
+func (r *fakeCoachRepository) EnsureDailyPlan(context.Context, string, time.Time) (CoachDailyPlan, error) {
+	return CoachDailyPlan{}, nil
+}
+func (r *fakeCoachRepository) GetProgress(context.Context, string, time.Time, time.Time) (CoachProgress, error) {
+	return CoachProgress{}, nil
+}
+func (r *fakeCoachRepository) ListGaps(context.Context, string, string, int) ([]FeynmanGap, error) {
+	return nil, nil
+}
+func (r *fakeCoachRepository) GetTask(_ context.Context, userID, taskID string) (CoachDailyTask, error) {
+	task := r.task
+	task.UserID = userID
+	task.CoachTaskID = taskID
+	return task, nil
+}
+func (r *fakeCoachRepository) GetGap(_ context.Context, userID, gapID string) (FeynmanGap, error) {
+	return FeynmanGap{GapID: gapID, UserID: userID, GapKey: "key_points-target", DiagnosticDimension: FeynmanDimensionKeyPoints, Title: "target"}, nil
+}
+func (r *fakeCoachRepository) StartTaskInSession(_ context.Context, p StartCoachTaskParams) (CoachDailyTask, error) {
+	r.startCalls++
+	r.starts = append(r.starts, p)
+	if r.startErr != nil {
+		return CoachDailyTask{}, r.startErr
+	}
+	if r.practice != nil && r.practice.found && r.practice.state.LastAnsweredMessageID == p.UserMessageID && r.practice.state.LastFeedback == p.Reply {
+		t := r.task
+		t.CoachTaskID, t.UserID, t.SessionID = p.CoachTaskID, p.UserID, p.SessionID
+		return t, nil
+	}
+	t := r.task
+	t.CoachTaskID = p.CoachTaskID
+	t.UserID = p.UserID
+	t.SessionID = p.SessionID
+	if r.practice != nil {
+		r.practice.state = FeynmanPracticeState{
+			UserID: p.UserID, SessionID: p.SessionID, State: FeynmanStateAwaitingAnswer,
+			ActiveQuestionText: t.QuestionText, OriginalQuestionText: t.QuestionText,
+			QuestionOrigin: FeynmanQuestionOriginCoachTask, CoachTaskID: p.CoachTaskID,
+			LastAnsweredMessageID: p.UserMessageID, LastFeedback: p.Reply, RoundNo: 1,
+		}
+		r.practice.found = true
+	}
+	return t, nil
+}
+func (r *fakeCoachRepository) FetchPriorGapEvidence(context.Context, string, []string) (map[string]PriorGapEvidence, error) {
+	return r.prior, nil
+}
+func (r *fakeCoachRepository) ControlTask(_ context.Context, p CoachTaskControlParams) error {
+	r.control = append(r.control, p)
+	if r.practice != nil {
+		r.practice.state = p.PracticeState
+		r.practice.found = true
+	}
+	return nil
+}
+func (r *fakeCoachRepository) CommitAnalysis(_ context.Context, p CommitCoachAnalysisParams) (CoachAttempt, error) {
+	r.commits = append(r.commits, p)
+	return p.Attempt, nil
+}
+
 type fakeAnswerAnalyzer struct {
 	calls  int
 	input  AnswerAnalysisInput
@@ -85,6 +157,7 @@ func testStreamRequest(message, messageID string) (ChatStreamRequest, *strings.B
 		TraceID:       "trace-1",
 		Message:       message,
 		UserMessageID: messageID,
+		LocalDate:     time.Now().Format(time.DateOnly),
 		OnDelta: func(delta string) error {
 			output.WriteString(delta)
 			return nil
@@ -518,6 +591,307 @@ func TestFeynmanDialogServiceRecoversFromInterruptedAnalysis(t *testing.T) {
 	}
 	if analyzer.calls != 1 {
 		t.Fatalf("恢复后应正常分析一次, 实际 %d", analyzer.calls)
+	}
+}
+
+func TestFeynmanDialogServiceLaunchesCoachTaskFromStoredQuestion(t *testing.T) {
+	practice := &fakeFeynmanPracticeRepo{}
+	coach := &fakeCoachRepository{task: CoachDailyTask{QuestionText: "服务端处方原题"}}
+	analyzer := &fakeAnswerAnalyzer{result: AnswerAnalysisResult{}}
+	service := NewFeynmanDialogService(practice, analyzer, nil, FeynmanDialogLimits{}, discardLogger(), coach)
+	request, output := testStreamRequest("客户端展示文案，不能当题目", "msg-launch")
+	request.CoachTaskID = "019fd849-c39b-7342-ab30-5b2a7d40a681"
+	handled, content, err := service.Handle(context.Background(), request)
+	if err != nil || !handled {
+		t.Fatalf("launch = (%v, %q, %v)", handled, content, err)
+	}
+	if analyzer.calls != 0 || len(coach.commits) != 0 {
+		t.Fatalf("launch must not analyze: calls=%d commits=%d", analyzer.calls, len(coach.commits))
+	}
+	if content != "每日教练题：服务端处方原题" {
+		t.Fatalf("reply=%q", content)
+	}
+	if coach.startCalls != 1 || output.String() != content {
+		t.Fatalf("start=%d output=%q", coach.startCalls, output.String())
+	}
+}
+
+func TestFeynmanDialogServiceCoachLaunchPersistsReplayBeforeEmit(t *testing.T) {
+	practice := &fakeFeynmanPracticeRepo{}
+	coach := &fakeCoachRepository{task: CoachDailyTask{QuestionText: "服务端处方原题"}, practice: practice}
+	service := NewFeynmanDialogService(practice, &fakeAnswerAnalyzer{}, nil, FeynmanDialogLimits{}, discardLogger(), coach)
+	request, _ := testStreamRequest("开始", "019fd849-c39b-7342-ab30-5b2a7d40a688")
+	request.CoachTaskID = "019fd849-c39b-7342-ab30-5b2a7d40a681"
+	request.OnDelta = func(string) error { return errors.New("client disconnected") }
+	if _, _, err := service.Handle(context.Background(), request); err == nil {
+		t.Fatal("expected emit failure")
+	}
+	if len(coach.starts) != 1 || coach.starts[0].UserMessageID != request.UserMessageID || coach.starts[0].Reply != "每日教练题：服务端处方原题" {
+		t.Fatalf("start replay fields = %+v", coach.starts)
+	}
+	request.OnDelta = nil
+	handled, reply, err := service.Handle(context.Background(), request)
+	if err != nil || !handled || reply != "每日教练题：服务端处方原题" || len(coach.starts) != 1 {
+		t.Fatalf("launch replay = (%v,%q,%v), starts=%d", handled, reply, err, len(coach.starts))
+	}
+}
+
+func TestFeynmanDialogServiceCoachControlPersistsReplayBeforeEmit(t *testing.T) {
+	practice := &fakeFeynmanPracticeRepo{found: true, state: FeynmanPracticeState{
+		State: FeynmanStateAwaitingAnswer, ActiveQuestionText: "原题", OriginalQuestionText: "原题",
+		QuestionOrigin: FeynmanQuestionOriginCoachTask, CoachTaskID: "task-1",
+	}}
+	coach := &fakeCoachRepository{practice: practice}
+	service := NewFeynmanDialogService(practice, &fakeAnswerAnalyzer{}, nil, FeynmanDialogLimits{}, discardLogger(), coach)
+	request, _ := testStreamRequest("暂停", "019fd849-c39b-7342-ab30-5b2a7d40a689")
+	request.CoachTaskID = "task-1"
+	request.OnDelta = func(string) error { return errors.New("client disconnected") }
+	if _, _, err := service.Handle(context.Background(), request); err == nil {
+		t.Fatal("expected emit failure")
+	}
+	if len(coach.control) != 1 || coach.control[0].UserMessageID != request.UserMessageID ||
+		coach.control[0].PracticeState.LastAnsweredMessageID != request.UserMessageID || coach.control[0].Reply == "" {
+		t.Fatalf("control replay fields = %+v", coach.control)
+	}
+	request.OnDelta = nil
+	handled, reply, err := service.Handle(context.Background(), request)
+	if err != nil || !handled || reply != feynmanCopyPaused || len(coach.control) != 1 {
+		t.Fatalf("control replay = (%v,%q,%v), controls=%d", handled, reply, err, len(coach.control))
+	}
+}
+
+func TestFeynmanDialogServiceCoachCorrectionUsesClientLocalDate(t *testing.T) {
+	practice := &fakeFeynmanPracticeRepo{found: true, state: FeynmanPracticeState{
+		State: FeynmanStateAwaitingRetry, ActiveQuestionText: "原题", OriginalQuestionText: "原题",
+		QuestionOrigin: FeynmanQuestionOriginCoachTask, CoachTaskID: "task-1", RetryRequired: true,
+	}}
+	coach := &fakeCoachRepository{task: CoachDailyTask{TaskDate: time.Date(2026, 8, 1, 0, 0, 0, 0, time.Local)}}
+	service := NewFeynmanDialogService(practice, &fakeAnswerAnalyzer{result: AnswerAnalysisResult{}}, nil, FeynmanDialogLimits{}, discardLogger(), coach)
+	request, _ := testStreamRequest("完整纠正", "019fd849-c39b-7342-ab30-5b2a7d40a690")
+	request.CoachTaskID = "task-1"
+	wantDate := time.Now().Format(time.DateOnly)
+	request.LocalDate = wantDate
+	if _, _, err := service.Handle(context.Background(), request); err != nil {
+		t.Fatalf("correction error = %v", err)
+	}
+	if got := coach.commits[0].CorrectionDate.Format(time.DateOnly); got != wantDate {
+		t.Fatalf("correction date = %s, want %s", got, wantDate)
+	}
+}
+
+func TestFeynmanDialogServiceCoachActiveAnswerRequiresLocalDate(t *testing.T) {
+	practice := &fakeFeynmanPracticeRepo{found: true, state: FeynmanPracticeState{
+		State: FeynmanStateAwaitingAnswer, ActiveQuestionText: "原题", OriginalQuestionText: "原题",
+		QuestionOrigin: FeynmanQuestionOriginCoachTask, CoachTaskID: "task-1",
+	}}
+	coach := &fakeCoachRepository{task: CoachDailyTask{QuestionText: "原题"}}
+	service := NewFeynmanDialogService(practice, &fakeAnswerAnalyzer{result: AnswerAnalysisResult{}}, nil, FeynmanDialogLimits{}, discardLogger(), coach)
+	request, _ := testStreamRequest("完整回答", "019fd849-c39b-7342-ab30-5b2a7d40a691")
+	request.CoachTaskID = "task-1"
+	request.LocalDate = ""
+	if _, _, err := service.Handle(context.Background(), request); !errors.Is(err, ErrCoachAnalysisInput) {
+		t.Fatalf("missing local_date error = %v", err)
+	}
+}
+
+func TestCoachAnswerLocalDateRejectsFarDate(t *testing.T) {
+	now := time.Date(2026, 8, 7, 12, 0, 0, 0, time.Local)
+	for _, value := range []string{"2026-08-05", "2026-08-09", "2026-8-7"} {
+		if _, err := coachAnswerLocalDate(value, now); !errors.Is(err, ErrCoachAnalysisInput) {
+			t.Fatalf("coachAnswerLocalDate(%q) error = %v", value, err)
+		}
+	}
+}
+
+func TestFeynmanDialogServiceCoachMatchingSecondRequestAnalyzes(t *testing.T) {
+	practice := &fakeFeynmanPracticeRepo{found: true, state: FeynmanPracticeState{
+		State: FeynmanStateAwaitingAnswer, ActiveQuestionText: "服务端处方原题", OriginalQuestionText: "服务端处方原题",
+		QuestionOrigin: FeynmanQuestionOriginCoachTask, CoachTaskID: "task-1", RoundNo: 1,
+	}}
+	analyzer := &fakeAnswerAnalyzer{result: AnswerAnalysisResult{}}
+	coach := &fakeCoachRepository{task: CoachDailyTask{QuestionText: "服务端处方原题"}}
+	service := NewFeynmanDialogService(practice, analyzer, nil, FeynmanDialogLimits{}, discardLogger(), coach)
+	request, _ := testStreamRequest("这是第二个请求里的完整回答", "019fd849-c39b-7342-ab30-5b2a7d40a685")
+	request.CoachTaskID = "task-1"
+	handled, content, err := service.Handle(context.Background(), request)
+	if err != nil || !handled || content != "这次回答通过。" {
+		t.Fatalf("answer=(%v,%q,%v)", handled, content, err)
+	}
+	if analyzer.calls != 1 || analyzer.input.Question != "服务端处方原题" || len(coach.commits) != 1 {
+		t.Fatalf("analysis=%+v calls=%d commits=%d", analyzer.input, analyzer.calls, len(coach.commits))
+	}
+}
+
+func TestFeynmanDialogServiceRetestTargetDecisionIsIndependentOfNewGap(t *testing.T) {
+	practice := &fakeFeynmanPracticeRepo{found: true, state: FeynmanPracticeState{
+		State: FeynmanStateAwaitingAnswer, ActiveQuestionText: "复测原题", OriginalQuestionText: "复测原题",
+		QuestionOrigin: FeynmanQuestionOriginCoachTask, CoachTaskID: "task-retest", RoundNo: 1,
+	}}
+	analyzer := &fakeAnswerAnalyzer{result: AnswerAnalysisResult{Gaps: []AnswerAnalysisGap{{
+		Dimension: FeynmanDimensionKeyPoints, ConceptLabel: "新遗漏", Verdict: FeynmanGapVerdictOmitted, Analysis: "补全新遗漏",
+	}}}}
+	coach := &fakeCoachRepository{task: CoachDailyTask{
+		TaskDate: time.Date(2026, 8, 7, 0, 0, 0, 0, time.Local), SourceGapID: "target-gap", SourceReviewID: "review-2",
+	}}
+	service := NewFeynmanDialogService(practice, analyzer, nil, FeynmanDialogLimits{}, discardLogger(), coach)
+	request, _ := testStreamRequest("目标已讲清但出现了另一个遗漏", "019fd849-c39b-7342-ab30-5b2a7d40a686")
+	request.CoachTaskID = "task-retest"
+	if _, _, err := service.Handle(context.Background(), request); err != nil {
+		t.Fatalf("retest answer error = %v", err)
+	}
+	commit := coach.commits[0]
+	if commit.ReviewDecision.CurrentReviewStatus != FeynmanGapReviewStatusPassed || !commit.Gaps[0].RequiresCorrection {
+		t.Fatalf("commit decision/gaps = %+v / %+v", commit.ReviewDecision, commit.Gaps)
+	}
+}
+
+func TestFeynmanDialogServiceRetestTargetRecurrenceFailsReview(t *testing.T) {
+	practice := &fakeFeynmanPracticeRepo{found: true, state: FeynmanPracticeState{
+		State: FeynmanStateAwaitingAnswer, ActiveQuestionText: "复测原题", OriginalQuestionText: "复测原题",
+		QuestionOrigin: FeynmanQuestionOriginCoachTask, CoachTaskID: "task-retest", RoundNo: 1,
+	}}
+	analyzer := &fakeAnswerAnalyzer{result: AnswerAnalysisResult{Gaps: []AnswerAnalysisGap{{
+		Dimension: FeynmanDimensionKeyPoints, ConceptLabel: "target", Verdict: FeynmanGapVerdictOmitted, UserQuote: "仍遗漏目标", Analysis: "目标仍遗漏",
+	}}}}
+	coach := &fakeCoachRepository{task: CoachDailyTask{
+		TaskDate: time.Date(2026, 8, 7, 0, 0, 0, 0, time.Local), SourceGapID: "target-gap", SourceReviewID: "review-1",
+	}}
+	service := NewFeynmanDialogService(practice, analyzer, nil, FeynmanDialogLimits{}, discardLogger(), coach)
+	request, _ := testStreamRequest("仍遗漏目标", "019fd849-c39b-7342-ab30-5b2a7d40a687")
+	request.CoachTaskID = "task-retest"
+	if _, _, err := service.Handle(context.Background(), request); err != nil {
+		t.Fatalf("retest answer error = %v", err)
+	}
+	commit := coach.commits[0]
+	if commit.ReviewDecision.CurrentReviewStatus != FeynmanGapReviewStatusFailed || !commit.ReviewDecision.TargetRecurred || commit.Gaps[0].ForceCanonicalGapID != "target-gap" {
+		t.Fatalf("commit decision/gaps = %+v / %+v", commit.ReviewDecision, commit.Gaps)
+	}
+}
+
+func TestFeynmanDialogServiceCoachRequiresMatchingTaskID(t *testing.T) {
+	practice := &fakeFeynmanPracticeRepo{found: true, state: FeynmanPracticeState{
+		State: FeynmanStateAwaitingAnswer, ActiveQuestionText: "原题", OriginalQuestionText: "原题",
+		QuestionOrigin: FeynmanQuestionOriginCoachTask, CoachTaskID: "task-1",
+	}}
+	service := NewFeynmanDialogService(practice, &fakeAnswerAnalyzer{}, nil, FeynmanDialogLimits{}, discardLogger(), &fakeCoachRepository{})
+	request, _ := testStreamRequest("回答", "msg-missing")
+	if _, _, err := service.Handle(context.Background(), request); !errors.Is(err, ErrCoachTaskIDRequired) {
+		t.Fatalf("missing id error=%v", err)
+	}
+	request.CoachTaskID = "task-2"
+	if _, _, err := service.Handle(context.Background(), request); !errors.Is(err, ErrCoachTaskMismatch) {
+		t.Fatalf("mismatch error=%v", err)
+	}
+}
+
+func TestCoachWeaknessClassifiers(t *testing.T) {
+	cases := []struct {
+		name  string
+		gap   AnswerAnalysisGap
+		prior PriorGapEvidence
+		want  string
+	}{
+		{"expression", AnswerAnalysisGap{Dimension: FeynmanDimensionExpression}, PriorGapEvidence{}, CoachGapTypeExpression},
+		{"project", AnswerAnalysisGap{Dimension: FeynmanDimensionProjectMapping}, PriorGapEvidence{}, CoachGapTypeProjectEvidence},
+		{"recall", AnswerAnalysisGap{Dimension: FeynmanDimensionKeyPoints}, PriorGapEvidence{GapID: "old", Status: FeynmanGapStatusResolved}, CoachGapTypeRecall},
+		{"knowledge", AnswerAnalysisGap{Dimension: FeynmanDimensionCausalChain}, PriorGapEvidence{}, CoachGapTypeKnowledge},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifyCoachWeakness(tc.gap, tc.prior); got != tc.want {
+				t.Fatalf("got %s want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFeynmanDialogServiceCoachStrictRetryPersistsAllGapsAndOriginalQuestion(t *testing.T) {
+	practice := &fakeFeynmanPracticeRepo{found: true, state: FeynmanPracticeState{State: FeynmanStateAwaitingAnswer, ActiveQuestionText: "原题", OriginalQuestionText: "原题", QuestionOrigin: FeynmanQuestionOriginCoachTask, CoachTaskID: "task-1", RoundNo: 1}}
+	analyzer := &fakeAnswerAnalyzer{result: AnswerAnalysisResult{Covered: []string{"不要展示"}, NextProbe: "不要采用模型追问", Gaps: []AnswerAnalysisGap{
+		{Dimension: FeynmanDimensionExpression, ConceptLabel: "表达", Verdict: FeynmanGapVerdictUncertain, Analysis: "先说结论"},
+		{Dimension: FeynmanDimensionKeyPoints, ConceptLabel: "关键遗漏", Verdict: FeynmanGapVerdictOmitted, Analysis: "补充关键点"},
+		{Dimension: FeynmanDimensionFactBoundary, ConceptLabel: "事实错误", Verdict: FeynmanGapVerdictIncorrect, UserQuote: "保证不丢", Analysis: "只能降低概率"},
+	}}}
+	coach := &fakeCoachRepository{prior: map[string]PriorGapEvidence{}}
+	service := NewFeynmanDialogService(practice, analyzer, nil, FeynmanDialogLimits{}, discardLogger(), coach)
+	request, _ := testStreamRequest("它保证不丢", "019fd849-c39b-7342-ab30-5b2a7d40a682")
+	request.CoachTaskID = "task-1"
+	handled, content, err := service.Handle(context.Background(), request)
+	if err != nil || !handled {
+		t.Fatalf("answer = (%v,%q,%v)", handled, content, err)
+	}
+	if len(coach.commits) != 1 || len(coach.commits[0].Gaps) != 3 {
+		t.Fatalf("commits=%+v", coach.commits)
+	}
+	commit := coach.commits[0]
+	if commit.Attempt.Outcome != CoachAttemptOutcomeRetryRequired || commit.PracticeState.State != FeynmanStateAwaitingRetry || !commit.PracticeState.RetryRequired || commit.PracticeState.ActiveQuestionText != "原题" {
+		t.Fatalf("commit=%+v", commit)
+	}
+	if strings.Contains(content, "不要展示") || strings.Contains(content, "不要采用模型追问") || !strings.Contains(content, "保证不丢") || !strings.Contains(content, "现在重新完整回答原题：原题") {
+		t.Fatalf("feedback=%q", content)
+	}
+	focus := 0
+	for _, g := range commit.Gaps {
+		if g.IsFocus {
+			focus++
+			if g.Title != "事实错误" {
+				t.Fatalf("focus=%+v", g)
+			}
+		}
+	}
+	if focus != 1 {
+		t.Fatalf("focus count=%d", focus)
+	}
+}
+
+func TestFeynmanDialogServiceCoachRepeatedFailureThenPass(t *testing.T) {
+	practice := &fakeFeynmanPracticeRepo{found: true, state: FeynmanPracticeState{State: FeynmanStateAwaitingRetry, ActiveQuestionText: "原题", OriginalQuestionText: "原题", QuestionOrigin: FeynmanQuestionOriginCoachTask, CoachTaskID: "task-1", RetryRequired: true, RoundNo: 2}}
+	analyzer := &fakeAnswerAnalyzer{result: AnswerAnalysisResult{Gaps: []AnswerAnalysisGap{{Dimension: FeynmanDimensionKeyPoints, ConceptLabel: "遗漏", Verdict: FeynmanGapVerdictOmitted, Analysis: "补上关键点"}}}}
+	coach := &fakeCoachRepository{prior: map[string]PriorGapEvidence{}}
+	service := NewFeynmanDialogService(practice, analyzer, nil, FeynmanDialogLimits{}, discardLogger(), coach)
+	request, _ := testStreamRequest("第二次仍没讲全", "019fd849-c39b-7342-ab30-5b2a7d40a683")
+	request.CoachTaskID = "task-1"
+	_, content, err := service.Handle(context.Background(), request)
+	if err != nil || !strings.Contains(content, "原题") {
+		t.Fatalf("first=%q %v", content, err)
+	}
+	practice.state = coach.commits[0].PracticeState
+	analyzer.result = AnswerAnalysisResult{}
+	request, _ = testStreamRequest("第三次完整讲清", "019fd849-c39b-7342-ab30-5b2a7d40a684")
+	request.CoachTaskID = "task-1"
+	_, content, err = service.Handle(context.Background(), request)
+	if err != nil || content != "这次回答通过。" {
+		t.Fatalf("pass=%q %v", content, err)
+	}
+	last := coach.commits[len(coach.commits)-1]
+	if last.Attempt.Outcome != CoachAttemptOutcomePassed || last.PracticeState.State != FeynmanStateIdle || last.PracticeState.CoachTaskID != "" {
+		t.Fatalf("last=%+v", last)
+	}
+}
+
+func TestFeynmanDialogServiceCoachPauseResumeAndSkipAreAtomic(t *testing.T) {
+	practice := &fakeFeynmanPracticeRepo{found: true, state: FeynmanPracticeState{State: FeynmanStateAwaitingRetry, ActiveQuestionText: "原题", OriginalQuestionText: "原题", QuestionOrigin: FeynmanQuestionOriginCoachTask, CoachTaskID: "task-1", RetryRequired: true}}
+	coach := &fakeCoachRepository{}
+	service := NewFeynmanDialogService(practice, &fakeAnswerAnalyzer{}, nil, FeynmanDialogLimits{}, discardLogger(), coach)
+	request, _ := testStreamRequest("暂停", "msg-pause")
+	request.CoachTaskID = "task-1"
+	_, _, err := service.Handle(context.Background(), request)
+	if err != nil || len(coach.control) != 1 || coach.control[0].Action != "pause" || !coach.control[0].PracticeState.RetryRequired {
+		t.Fatalf("pause=%+v %v", coach.control, err)
+	}
+	practice.state = coach.control[0].PracticeState
+	request, _ = testStreamRequest("继续", "msg-resume")
+	request.CoachTaskID = "task-1"
+	_, content, err := service.Handle(context.Background(), request)
+	if err != nil || coach.control[1].PracticeState.State != FeynmanStateAwaitingRetry || !strings.Contains(content, "原题") {
+		t.Fatalf("resume=%+v %q %v", coach.control, content, err)
+	}
+	practice.state = coach.control[1].PracticeState
+	request, _ = testStreamRequest("跳过这题", "msg-skip")
+	request.CoachTaskID = "task-1"
+	_, _, err = service.Handle(context.Background(), request)
+	if err != nil || coach.control[2].Action != "skip" || coach.control[2].PracticeState.State != FeynmanStateIdle {
+		t.Fatalf("skip=%+v %v", coach.control, err)
 	}
 }
 

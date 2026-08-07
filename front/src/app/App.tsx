@@ -1,7 +1,14 @@
-import { useState, useRef, useEffect, useLayoutEffect } from "react";
+import {
+  useState,
+  useRef,
+  useEffect,
+  useLayoutEffect,
+  useCallback,
+  useMemo,
+} from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { BrainCircuit } from "lucide-react";
-import { StatusTags, StatusTagDef } from "./components/StatusTags";
+import { StatusTags } from "./components/StatusTags";
 import { InputDock } from "./components/InputDock";
 import { UserMessage } from "./components/UserMessage";
 import { AIMessage } from "./components/AIMessage";
@@ -28,12 +35,27 @@ import {
   type SessionListItem,
   type SessionMessage,
   type RetrievalSources,
+  ChatStreamError,
 } from "./api/chat";
 import { AuthPage } from "./pages/AuthPage";
 import {
   getApplicationCapabilities,
   type ApplicationCapabilities,
 } from "./api/capabilities";
+import {
+  getCoachGaps,
+  getCoachProgress,
+  getCoachToday,
+  type CoachGap,
+  type CoachProgress,
+  type CoachTask,
+  type CoachToday,
+} from "./api/coach";
+import {
+  addLocalDays,
+  buildCoachStatusTags,
+  localDateKey,
+} from "./lib/coach-view-model";
 
 interface Message {
   id: string;
@@ -45,47 +67,19 @@ interface Message {
   failed?: boolean;
   // retry 保存失败发送的原始负载：重试时复用同一 client_message_id 命中后端幂等，
   // 避免重复计费/重复落库；只有全新发送才生成新的 UUID。
-  retry?: { clientMessageID: string; text: string; voiceCaptureID?: string };
+  retry?: {
+    sessionID: string;
+    clientMessageID: string;
+    text: string;
+    options: {
+      voiceCaptureID?: string;
+      coachTaskID?: string;
+      localDate?: string;
+    };
+    retryable: boolean;
+  };
   retrieval?: RetrievalSources;
 }
-
-const INITIAL_TAGS: StatusTagDef[] = [
-  {
-    id: "output-streak",
-    emoji: "🔥",
-    label: "连续输出 3 天",
-    color: "bg-[#FFF5E6] text-[#A67C52]",
-    state: "active",
-    sparklineData: [
-      { v: 4 },
-      { v: 5 },
-      { v: 6 },
-      { v: 6 },
-      { v: 7 },
-      { v: 8 },
-      { v: 8 },
-    ],
-    summary: "连续 3 天完成主动输出，本周已产生 5 条练习证据。",
-  },
-  {
-    id: "review",
-    emoji: "📌",
-    label: "2 项待回顾",
-    color: "bg-[#E9EEF8] text-[#526A91]",
-    state: "active",
-    expandable: false,
-    sparklineData: [
-      { v: 3 },
-      { v: 4 },
-      { v: 5 },
-      { v: 5 },
-      { v: 4 },
-      { v: 3 },
-      { v: 3 },
-    ],
-    summary: "Kafka 消息积压与 Go GC 将在今天进入间隔复习。",
-  },
-];
 
 const WELCOME_MESSAGE: Message = {
   id: "welcome",
@@ -114,7 +108,6 @@ function mapBackendMessages(items: SessionMessage[]): Message[] {
 }
 
 function InterviewWorkspace() {
-  const tags = INITIAL_TAGS;
   const [messages, setMessages] = useState<Message[]>([
     {
       id: "welcome",
@@ -134,10 +127,36 @@ function InterviewWorkspace() {
   const [practiceState, setPracticeState] = useState<FeynmanPracticeState | null>(null);
   const [profileOpen, setProfileOpen] = useState(false);
   const [isSending, setIsSending] = useState(false);
+  const [transitionBusy, setTransitionBusy] = useState(false);
   const [capabilities, setCapabilities] = useState<ApplicationCapabilities | null>(null);
+  const [capabilityLoading, setCapabilityLoading] = useState(true);
+  const [capabilityError, setCapabilityError] = useState<string | null>(null);
+  const [coachToday, setCoachToday] = useState<CoachToday | null>(null);
+  const [coachProgress, setCoachProgress] = useState<CoachProgress | null>(null);
+  const [coachGaps, setCoachGaps] = useState<CoachGap[]>([]);
+  const [coachLoading, setCoachLoading] = useState(false);
+  const [coachError, setCoachError] = useState<string | null>(null);
+  const [gapsLoaded, setGapsLoaded] = useState(false);
+  const [gapsLoading, setGapsLoading] = useState(false);
+  const [gapsError, setGapsError] = useState<string | null>(null);
+  const [launchingTaskID, setLaunchingTaskID] = useState<string | null>(null);
   const [inputDockHeight, setInputDockHeight] = useState(176);
+  const tags = useMemo(
+    () => buildCoachStatusTags(coachProgress, coachToday),
+    [coachProgress, coachToday],
+  );
   const scrollRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const activeSessionIDRef = useRef<string | null>(null);
+  const sessionLoadGenerationRef = useRef(0);
+  const coachRefreshGenerationRef = useRef(0);
+  const transitionBusyRef = useRef(false);
+
+  const updateActiveSessionID = useCallback((sessionID: string | null) => {
+    activeSessionIDRef.current = sessionID;
+    setActiveSessionID(sessionID);
+    if (sessionID) rememberSessionID(sessionID);
+  }, []);
   // resolveTime 为每条消息提供稳定的时间戳：历史消息用自带 time，实时消息按 id 缓存首次渲染时刻。
   const timeCacheRef = useRef<Map<string, string>>(new Map());
   const resolveTime = (message: Message): string => {
@@ -167,37 +186,135 @@ function InterviewWorkspace() {
     }
   };
 
-  // loadSessionMessages 用后端历史消息替换聊天区；无历史时回退到欢迎语。
-  const loadSessionMessages = async (sessionID: string) => {
+  const isCurrentSessionLoad = (sessionID: string, generation: number) =>
+    generation === sessionLoadGenerationRef.current &&
+    activeSessionIDRef.current === sessionID;
+
+  // loadSessionMessages 用后端历史消息替换聊天区；过期切换请求不得覆盖新会话。
+  const loadSessionMessages = async (sessionID: string, generation: number) => {
     try {
       const items = await listSessionMessages(sessionID);
-      setMessages(mapBackendMessages(items));
+      if (isCurrentSessionLoad(sessionID, generation)) {
+        setMessages(mapBackendMessages(items));
+      }
     } catch {
-      setMessages([WELCOME_MESSAGE]);
+      if (isCurrentSessionLoad(sessionID, generation)) {
+        setMessages([WELCOME_MESSAGE]);
+      }
     }
   };
 
-  // refreshPracticeState 以服务端为准恢复练习状态条（刷新页面、切回旧会话都靠它）。
-  // 读不到就当作没在练习，不弹错：状态条缺一次不影响聊天。
-  const refreshPracticeState = async (sessionID: string) => {
+  // refreshPracticeState 以服务端为准恢复练习状态条；过期请求不得覆盖新会话。
+  const refreshPracticeState = async (sessionID: string, generation: number) => {
     try {
-      setPracticeState(await getFeynmanPracticeState(sessionID));
+      const state = await getFeynmanPracticeState(sessionID);
+      if (isCurrentSessionLoad(sessionID, generation)) setPracticeState(state);
     } catch {
-      setPracticeState(null);
+      if (isCurrentSessionLoad(sessionID, generation)) setPracticeState(null);
     }
   };
+
+  const switchSession = useCallback(
+    async (sessionID: string, options: { load?: boolean } = {}) => {
+      if (transitionBusyRef.current) return false;
+      transitionBusyRef.current = true;
+      setTransitionBusy(true);
+      const generation = ++sessionLoadGenerationRef.current;
+      updateActiveSessionID(sessionID);
+      setPracticeState(null);
+      if (options.load === false) setMessages([WELCOME_MESSAGE]);
+      try {
+        if (options.load !== false) {
+          await Promise.all([
+            loadSessionMessages(sessionID, generation),
+            refreshPracticeState(sessionID, generation),
+          ]);
+        }
+        return isCurrentSessionLoad(sessionID, generation);
+      } finally {
+        if (generation === sessionLoadGenerationRef.current) {
+          transitionBusyRef.current = false;
+          setTransitionBusy(false);
+        }
+      }
+    },
+    [updateActiveSessionID],
+  );
+
+  const refreshCoachData = useCallback(
+    async (includeGaps = false) => {
+      if (capabilities?.coach !== true) return;
+
+      const generation = ++coachRefreshGenerationRef.current;
+      setCoachLoading(true);
+      setCoachError(null);
+      if (includeGaps) {
+        setGapsLoading(true);
+        setGapsError(null);
+      }
+      const now = new Date();
+      const requests: Promise<unknown>[] = [
+        getCoachToday(now),
+        getCoachProgress(addLocalDays(now, -89), now),
+      ];
+      if (includeGaps) requests.push(getCoachGaps("open", 50));
+
+      const [todayResult, progressResult, gapsResult] = await Promise.allSettled(requests);
+      if (generation !== coachRefreshGenerationRef.current) return;
+
+      const errors: string[] = [];
+      if (todayResult.status === "fulfilled") {
+        setCoachToday(todayResult.value as CoachToday);
+      } else {
+        errors.push(todayResult.reason instanceof Error ? todayResult.reason.message : "今日计划加载失败");
+      }
+      if (progressResult.status === "fulfilled") {
+        setCoachProgress(progressResult.value as CoachProgress);
+      } else {
+        errors.push(progressResult.reason instanceof Error ? progressResult.reason.message : "教练进度加载失败");
+      }
+      if (includeGaps && gapsResult) {
+        if (gapsResult.status === "fulfilled") {
+          setCoachGaps(gapsResult.value as CoachGap[]);
+          setGapsLoaded(true);
+          setGapsError(null);
+        } else {
+          setGapsError(
+            gapsResult.reason instanceof Error ? gapsResult.reason.message : "薄弱点加载失败",
+          );
+        }
+      }
+      setCoachError(errors.length ? errors.join("；") : null);
+      setCoachLoading(false);
+      if (includeGaps) setGapsLoading(false);
+    },
+    [capabilities?.coach],
+  );
+
+  // 身份建立后的首轮能力探测会触发真实 Coach 数据加载；进入计划或档案时重新拉取。
+  useEffect(() => {
+    if (capabilities?.coach !== true) return;
+    void refreshCoachData(profileOpen || activeView === "plan");
+  }, [activeView, profileOpen, capabilities?.coach, refreshCoachData]);
+
+  const retryCapabilities = useCallback(async () => {
+    setCapabilityLoading(true);
+    setCapabilityError(null);
+    try {
+      setCapabilities(await getApplicationCapabilities());
+    } catch (error) {
+      setCapabilities(null);
+      setCapabilityError(error instanceof Error ? error.message : "服务能力加载失败");
+    } finally {
+      setCapabilityLoading(false);
+    }
+  }, []);
 
   // 启动引导：拉列表 → 校验 localStorage → 选最近会话 → 无会话再创建 → 载入消息。
   useEffect(() => {
     let cancelled = false;
+    void retryCapabilities();
     (async () => {
-      try {
-        const available = await getApplicationCapabilities();
-        if (!cancelled) setCapabilities(available);
-      } catch {
-        if (!cancelled) setCapabilities(null);
-      }
-
       const list = await refreshSessions();
       if (cancelled) return;
 
@@ -217,10 +334,7 @@ function InterviewWorkspace() {
       }
 
       if (cancelled || !active) return;
-      setActiveSessionID(active);
-      rememberSessionID(active);
-      await loadSessionMessages(active);
-      await refreshPracticeState(active);
+      await switchSession(active);
     })();
 
     return () => {
@@ -231,33 +345,31 @@ function InterviewWorkspace() {
   }, []);
 
   const handleSelectSession = async (sessionID: string) => {
-    if (isSending) return;
+    if (isSending || transitionBusyRef.current) return;
     setSessionDrawerOpen(false);
-    if (sessionID === activeSessionID) return;
-    setActiveSessionID(sessionID);
-    rememberSessionID(sessionID);
-    await loadSessionMessages(sessionID);
-    await refreshPracticeState(sessionID);
+    if (sessionID === activeSessionIDRef.current) return;
+    await switchSession(sessionID);
   };
 
-  const handleCreateSession = async () => {
-    if (isSending) return;
+  const handleCreateSession = async (): Promise<string | null> => {
+    if (isSending || transitionBusyRef.current) return null;
     try {
       const sessionID = await createNewSession();
-      setActiveSessionID(sessionID);
-      rememberSessionID(sessionID);
-      setPracticeState(null);
-      setMessages([WELCOME_MESSAGE]);
+      const switched = await switchSession(sessionID, { load: false });
+      if (!switched) return null;
       setSessionDrawerOpen(false);
       await refreshSessions();
+      return sessionID;
     } catch {
       setSessionsError("创建会话失败");
+      return null;
     }
   };
 
   // handleRenameSession 会话重命名。TODO(后端): 接入 PATCH /api/v1/sessions/:id
   // 后改为调用后端并以返回结果为准；当前仅前端本地生效，刷新后会被后端列表覆盖。
   const handleRenameSession = (sessionID: string, title: string) => {
+    if (isSending || transitionBusyRef.current) return;
     setSessions((prev) =>
       prev.map((s) => (s.session_id === sessionID ? { ...s, title } : s))
     );
@@ -265,21 +377,19 @@ function InterviewWorkspace() {
 
   // handleDeleteSession 删除会话。TODO(后端): 接入 DELETE /api/v1/sessions/:id
   // 后改为调用后端软删除；当前仅前端本地移除，刷新后会被后端列表覆盖。
-  const handleDeleteSession = (sessionID: string) => {
-    if (isSending) return;
+  const handleDeleteSession = async (sessionID: string) => {
+    if (isSending || transitionBusyRef.current) return;
     const remaining = sessions.filter((s) => s.session_id !== sessionID);
     setSessions(remaining);
 
-    if (sessionID === activeSessionID) {
-      const next = remaining[0]?.session_id ?? null;
-      setActiveSessionID(next);
-      setPracticeState(null);
+    if (sessionID === activeSessionIDRef.current) {
+      const next = remaining[0]?.session_id;
       if (next) {
-        rememberSessionID(next);
-        void loadSessionMessages(next);
-        void refreshPracticeState(next);
+        await switchSession(next);
       } else {
-        setMessages([WELCOME_MESSAGE]);
+        const replacement = await createNewSession();
+        await switchSession(replacement, { load: false });
+        await refreshSessions();
       }
     }
   };
@@ -297,7 +407,11 @@ function InterviewWorkspace() {
     text: string,
     clientMessageID: string,
     targetId: string,
-    voiceCaptureID?: string
+    options: {
+      voiceCaptureID?: string;
+      coachTaskID?: string;
+      localDate?: string;
+    } = {},
   ) => {
     const controller = new AbortController();
     abortRef.current = controller;
@@ -310,6 +424,7 @@ function InterviewWorkspace() {
         text,
         (delta) => {
           acc += delta;
+          if (activeSessionIDRef.current !== sessionID) return;
           setMessages((prev) =>
             prev.map((m) =>
               m.id === targetId
@@ -319,52 +434,77 @@ function InterviewWorkspace() {
           );
         },
         (retrieval) => {
+          if (activeSessionIDRef.current !== sessionID) return;
           setMessages((prev) =>
             prev.map((message) =>
               message.id === targetId ? { ...message, retrieval } : message
             )
           );
         },
-        controller.signal,
-        // 练习状态跟随 done 帧回来，保证状态条与刚上屏的回复是同一轮的。
-        (state) => setPracticeState(state),
-        voiceCaptureID
+        {
+          signal: controller.signal,
+          onPracticeState: (state) => {
+            if (activeSessionIDRef.current === sessionID) setPracticeState(state);
+          },
+          voiceCaptureID: options.voiceCaptureID,
+          coachTaskID: options.coachTaskID,
+          localDate: options.localDate,
+        },
       );
-      // 回复完成后刷新会话列表，更新消息数与最近活跃时间。
       void refreshSessions();
-    } catch {
+    } catch (error) {
       if (controller.signal.aborted) {
-        // 用户主动停止：保留已生成内容；若还没吐出内容则给出停止提示。
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.id === targetId
-              ? { ...m, content: acc || "（已停止回答）" }
-              : m
-          )
-        );
+        if (activeSessionIDRef.current === sessionID) {
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === targetId
+                ? { ...m, content: acc || "（已停止回答）" }
+                : m
+            )
+          );
+        }
         void refreshSessions();
-      } else {
-        // 网络/后端失败：标记 failed 并保存原始负载，供用户复用同一 client_message_id 重试。
+      } else if (activeSessionIDRef.current === sessionID) {
+        const streamError = error instanceof ChatStreamError ? error : null;
+        const retryable = streamError?.retryable ?? true;
         setMessages((prev) =>
           prev.map((m) =>
             m.id === targetId
               ? {
                   ...m,
-                  content: "抱歉，暂时没能连上知镜，请稍后再试。",
+                  content: streamError?.message || "抱歉，暂时没能连上知镜，请稍后再试。",
                   failed: true,
-                  retry: { clientMessageID, text, voiceCaptureID },
+                  retry: {
+                    sessionID,
+                    clientMessageID,
+                    text,
+                    options: { ...options },
+                    retryable,
+                  },
                 }
               : m
           )
         );
       }
     } finally {
-      abortRef.current = null;
+      if (abortRef.current === controller) abortRef.current = null;
       setIsSending(false);
+      if (capabilities?.coach === true && options.coachTaskID) {
+        void refreshCoachData(profileOpen || activeView === "plan");
+        const generation = sessionLoadGenerationRef.current;
+        void refreshPracticeState(sessionID, generation);
+      }
     }
   };
 
   const handleSendMessage = async (text: string, voiceCaptureID?: string) => {
+    if (isSending || transitionBusyRef.current) return;
+    let sessionID = activeSessionIDRef.current;
+    if (!sessionID) {
+      sessionID = await ensureSessionID();
+      if (!(await switchSession(sessionID, { load: false }))) return;
+    }
+
     const userMessage: Message = {
       id: Date.now().toString(),
       type: "user",
@@ -379,31 +519,98 @@ function InterviewWorkspace() {
       { id: typingId, type: "ai", content: "" },
     ]);
 
-    const sessionID = activeSessionID ?? (await ensureSessionID());
-    if (!activeSessionID) {
-      setActiveSessionID(sessionID);
-      rememberSessionID(sessionID);
-    }
-    // 全新发送生成新的 client_message_id。
-    await streamAssistantReply(sessionID, text, crypto.randomUUID(), typingId, voiceCaptureID);
+    // 活动 Coach 的答案和控制 turn 自动携带任务 ID；本地日只随 Coach turn 发送。
+    const coachTaskID = practiceState?.coach_task_id || undefined;
+    await streamAssistantReply(sessionID, text, crypto.randomUUID(), typingId, {
+      voiceCaptureID,
+      coachTaskID,
+      localDate: coachTaskID ? localDateKey(new Date()) : undefined,
+    });
   };
 
   // handleRetryMessage 重试失败的助手回复：复用原 client_message_id，让后端幂等去重
   // （已完成则回放、进行中则拒绝、失败/过期才真正重跑），不会重复扣费或重复落库。
   const handleRetryMessage = async (messageId: string) => {
-    if (isSending) return;
+    if (isSending || transitionBusyRef.current) return;
     const target = messages.find((m) => m.id === messageId);
-    if (!target?.retry) return;
-    const { clientMessageID, text, voiceCaptureID } = target.retry;
-    const sessionID = activeSessionID ?? (await ensureSessionID());
-    setMessages((prev) =>
-      prev.map((m) =>
-        m.id === messageId
-          ? { ...m, content: "", failed: false, retry: undefined }
-          : m
-      )
-    );
-    await streamAssistantReply(sessionID, text, clientMessageID, messageId, voiceCaptureID);
+    if (!target?.retry?.retryable) return;
+    const { sessionID, clientMessageID, text, options } = target.retry;
+    if (activeSessionIDRef.current !== sessionID) {
+      const switched = await switchSession(sessionID);
+      if (!switched) return;
+      setMessages((prev) => [
+        ...prev,
+        { ...target, content: "", failed: false, retry: undefined },
+      ]);
+    } else {
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === messageId
+            ? { ...m, content: "", failed: false, retry: undefined }
+            : m
+        )
+      );
+    }
+    await streamAssistantReply(sessionID, text, clientMessageID, messageId, {
+      ...options,
+      localDate: options.coachTaskID ? localDateKey(new Date()) : options.localDate,
+    });
+  };
+
+  const handleLaunchCoachTask = async (task: CoachTask) => {
+    if (isSending || launchingTaskID || transitionBusyRef.current) return;
+    setLaunchingTaskID(task.coach_task_id);
+    setActiveView("practice");
+    setProfileOpen(false);
+    try {
+      let sessionID: string | null = null;
+      if (task.status === "pending") {
+        const practiceActive = practiceState != null && practiceState.state !== "idle";
+        if (practiceActive) {
+          sessionID = await handleCreateSession();
+        } else {
+          sessionID = activeSessionIDRef.current ?? (await ensureSessionID());
+          if (sessionID !== activeSessionIDRef.current) {
+            if (!(await switchSession(sessionID, { load: false }))) return;
+          }
+        }
+      } else {
+        if (!task.session_id) {
+          setCoachError("该教练任务缺少原会话，无法安全继续");
+          return;
+        }
+        sessionID = task.session_id;
+        if (sessionID !== activeSessionIDRef.current) {
+          if (!(await switchSession(sessionID))) return;
+        }
+      }
+      if (!sessionID) return;
+
+      const text = task.status === "pending" ? "开始今日教练任务" : "继续";
+      const userID = `${Date.now()}-coach-start`;
+      const typingID = `${userID}-typing`;
+      setMessages((prev) => [
+        ...prev,
+        { id: userID, type: "user", content: text },
+        { id: typingID, type: "ai", content: "" },
+      ]);
+      await streamAssistantReply(sessionID, text, crypto.randomUUID(), typingID, {
+        coachTaskID: task.coach_task_id,
+      });
+    } finally {
+      setLaunchingTaskID(null);
+    }
+  };
+
+  const openKnowledgeFromCoach = () => {
+    setProfileOpen(false);
+    setActiveView("knowledge");
+  };
+
+  const practiceMissedQuestion = () => {
+    setProfileOpen(false);
+    setActiveView("practice");
+    void handleSendMessage("我想练习最近一次面试中答漏的问题，请先让我输入原题。");
   };
 
   // handleStop 用户主动中止正在进行的流式回复。
@@ -427,7 +634,15 @@ function InterviewWorkspace() {
   return (
     <div className="size-full flex flex-col overflow-hidden bg-background relative">
       {profileOpen ? (
-        <ProfileDashboard onBack={() => setProfileOpen(false)} />
+        <ProfileDashboard
+          onBack={() => setProfileOpen(false)}
+          coachEnabled={capabilities?.coach === true}
+          progress={coachProgress}
+          gaps={coachGaps}
+          loading={coachLoading}
+          error={coachError}
+          onRetry={() => void refreshCoachData(true)}
+        />
       ) : activeView === "practice" ? (
         <>
           <AppHeader
@@ -533,7 +748,21 @@ function InterviewWorkspace() {
           />
         </>
       ) : activeView === "plan" ? (
-        <Dashboard mode="page" onOpenProfile={() => setProfileOpen(true)} />
+        <Dashboard
+          mode="page"
+          onOpenProfile={() => setProfileOpen(true)}
+          coachEnabled={capabilities?.coach === true}
+          today={coachToday}
+          progress={coachProgress}
+          gaps={coachGaps}
+          loading={coachLoading}
+          error={coachError}
+          launchingTaskID={launchingTaskID}
+          onRetry={() => void refreshCoachData(true)}
+          onLaunchTask={(task) => void handleLaunchCoachTask(task)}
+          onOpenKnowledge={openKnowledgeFromCoach}
+          onPracticeMissedQuestion={practiceMissedQuestion}
+        />
       ) : (
         <KnowledgeBasePage onOpenProfile={() => setProfileOpen(true)} />
       )}

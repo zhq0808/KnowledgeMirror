@@ -148,6 +148,9 @@ func run() error {
 		log.Info("候选内容抽取未启用（CANDIDATE_ENABLED=false）")
 	}
 
+	coachRepository := store.NewPostgresCoachRepository(db)
+	var coachService *service.CoachService
+
 	memoryRepository := store.NewPostgresMemoryRepository(db)
 	memoryService := service.NewMemoryService(memoryRepository, service.MemoryExtractionLimits{
 		MaxOperations:       cfg.Memory.MaxOperations,
@@ -268,9 +271,11 @@ func run() error {
 				MaxAnswerRunes:        cfg.Feynman.Dialog.MaxAnswerRunes,
 			},
 			log,
+			coachRepository,
 		)
 		chatService.WithPractice(feynmanDialogService)
-		log.Info("对话式费曼学习已启用", "prompt_version", cfg.Feynman.Dialog.PromptVersion, "model", dialogModel)
+		coachService = service.NewCoachService(coachRepository, time.Now)
+		log.Info("对话式费曼学习与每日教练已启用", "prompt_version", cfg.Feynman.Dialog.PromptVersion, "model", dialogModel)
 	} else {
 		log.Info("对话式费曼学习未启用（FEYNMAN_DIALOG_ENABLED=false）")
 	}
@@ -377,7 +382,7 @@ func run() error {
 		log.Info("语音合成未启用（SPEECH_ENABLED=false）")
 	}
 
-	srvHandler := handler.NewServer(chatService, identityService, sessionService, messageService, turnLeaseService, documentService, candidateService, retrievalService, nil, feynmanDialogService, voiceService, realtimeVoiceService, speechService, memoryPipeline, cfg.Identity, log).Handler()
+	srvHandler := handler.NewServer(chatService, identityService, sessionService, messageService, turnLeaseService, documentService, candidateService, retrievalService, coachService, nil, feynmanDialogService, voiceService, realtimeVoiceService, speechService, memoryPipeline, cfg.Identity, log).Handler()
 	srv := &http.Server{
 		Addr:              ":" + cfg.HTTP.Port,
 		Handler:           srvHandler,

@@ -5,6 +5,7 @@ import "github.com/gin-gonic/gin"
 type applicationCapabilities struct {
 	RealtimeVoice bool `json:"realtime_voice"`
 	Speech        bool `json:"speech"`
+	Coach         bool `json:"coach"`
 }
 
 // capabilitiesHandler 告诉前端当前进程实际注册了哪些可选能力。
@@ -13,5 +14,6 @@ func (s *Server) capabilitiesHandler(c *gin.Context) {
 	ok(c, applicationCapabilities{
 		RealtimeVoice: s.realtimeVoice != nil,
 		Speech:        s.speech != nil,
+		Coach:         s.coach != nil && s.practice != nil,
 	})
 }

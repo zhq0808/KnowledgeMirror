@@ -15,16 +15,22 @@ import (
 // 只暴露“当前状态 + 当前题目 + 第几轮”这三样：状态条要显示的就这些，
 // 反馈正文本身已经是对话里的一条 assistant 消息，不需要再复制一份。
 type feynmanPracticeStateResponse struct {
-	State    string `json:"state"`
-	Question string `json:"question"`
-	RoundNo  int    `json:"round_no"`
+	State            string `json:"state"`
+	Question         string `json:"question"`
+	RoundNo          int    `json:"round_no"`
+	CoachTaskID      string `json:"coach_task_id"`
+	OriginalQuestion string `json:"original_question"`
+	RetryRequired    bool   `json:"retry_required"`
 }
 
 func newFeynmanPracticeStateResponse(state service.FeynmanPracticeState) feynmanPracticeStateResponse {
 	return feynmanPracticeStateResponse{
-		State:    state.State,
-		Question: state.ActiveQuestionText,
-		RoundNo:  state.RoundNo,
+		State:            state.State,
+		Question:         state.ActiveQuestionText,
+		RoundNo:          state.RoundNo,
+		CoachTaskID:      state.CoachTaskID,
+		OriginalQuestion: state.OriginalQuestionText,
+		RetryRequired:    state.RetryRequired,
 	}
 }
 

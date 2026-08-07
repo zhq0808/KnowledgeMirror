@@ -115,7 +115,7 @@ func newRealtimeHandlerRig(t *testing.T, maxConcurrent int) *realtimeHandlerRig 
 	)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	server := NewServer(
-		nil, identityService, sessions, nil, nil, nil, nil, nil, nil, nil, nil,
+		nil, identityService, sessions, nil, nil, nil, nil, nil, nil, nil, nil, nil,
 		realtimeVoice, nil, nil,
 		config.IdentityConfig{GuestCookieName: realtimeTestCookieName}, log,
 	)

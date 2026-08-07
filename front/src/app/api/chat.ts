@@ -7,6 +7,7 @@ interface APIResponse {
   code: number;
   message: string;
   trace_id?: string;
+  retryable?: boolean;
 }
 
 interface GuestResponse {
@@ -18,7 +19,6 @@ interface SessionResponse {
   session_id: string;
 }
 
-// SessionListItem 对应后端 GET /api/v1/sessions 的单项返回。
 export interface SessionListItem {
   session_id: string;
   title: string;
@@ -28,8 +28,6 @@ export interface SessionListItem {
   created_at: string;
 }
 
-// SessionMessage 对应后端 GET /api/v1/sessions/:session_id/messages 的单项返回。
-// message_id 是后端生成的稳定 UUID 业务身份（不暴露数据库内部行主键）。
 export interface SessionMessage {
   message_id: string;
   role: string;
@@ -61,8 +59,6 @@ export interface RetrievalSources {
 
 const sessionIDKey = "interview_agent_session_id_v1";
 
-// createOrResumeGuest 始终请求后端：有效 HttpOnly Cookie 会恢复原 Guest，
-// 没有有效凭证时才原子创建新用户。user_id 仅用于响应诊断，不在前端持久化或授权。
 export async function createOrResumeGuest(): Promise<GuestResponse> {
   const res = await fetch("/api/v1/guest", {
     method: "POST",
@@ -73,9 +69,7 @@ export async function createOrResumeGuest(): Promise<GuestResponse> {
     throw new Error(body.message || "创建试用用户失败");
   }
 
-  if (body.data.created) {
-    localStorage.removeItem(sessionIDKey);
-  }
+  if (body.data.created) localStorage.removeItem(sessionIDKey);
   return body.data;
 }
 
@@ -102,58 +96,57 @@ export async function createNewSession(): Promise<string> {
   return requestNewSession();
 }
 
-// getActiveSessionID 读取当前记住的会话 ID；没有则返回 null。
 export function getActiveSessionID(): string | null {
   return localStorage.getItem(sessionIDKey);
 }
 
-// rememberSessionID 记住当前活跃会话 ID，供刷新后恢复。
 export function rememberSessionID(sessionID: string): void {
   localStorage.setItem(sessionIDKey, sessionID);
 }
 
-// listSessions 拉取当前访客名下的会话列表（后端按最近活跃倒序返回）。
 export async function listSessions(): Promise<SessionListItem[]> {
   const res = await fetch("/api/v1/sessions", {
     method: "GET",
     credentials: "include",
   });
   const body = (await res.json()) as APIResponse & { data?: SessionListItem[] };
-  if (!res.ok || body.code !== 0) {
-    throw new Error(body.message || "查询会话列表失败");
-  }
+  if (!res.ok || body.code !== 0) throw new Error(body.message || "查询会话列表失败");
   return body.data ?? [];
 }
 
-// listSessionMessages 拉取指定会话内已完成、未删除的历史消息。
-export async function listSessionMessages(
-  sessionID: string
-): Promise<SessionMessage[]> {
+export async function listSessionMessages(sessionID: string): Promise<SessionMessage[]> {
   const res = await fetch(
     `/api/v1/sessions/${encodeURIComponent(sessionID)}/messages`,
-    {
-      method: "GET",
-      credentials: "include",
-    }
+    { method: "GET", credentials: "include" },
   );
   const body = (await res.json()) as APIResponse & { data?: SessionMessage[] };
-  if (!res.ok || body.code !== 0) {
-    throw new Error(body.message || "查询会话消息失败");
-  }
+  if (!res.ok || body.code !== 0) throw new Error(body.message || "查询会话消息失败");
   return body.data ?? [];
 }
 
-// 一帧 SSE 解析后的结果。event 为 "message"(默认增量) | "done" | "error"。
-interface SSEFrame {
+export class ChatStreamError extends Error {
+  readonly code: number;
+  readonly retryable: boolean;
+
+  constructor(message: string, code = -1, retryable = true) {
+    super(message);
+    this.name = "ChatStreamError";
+    this.code = code;
+    this.retryable = retryable;
+  }
+}
+
+export interface ChatSSEFrame {
   event: string;
+  code?: number;
   delta?: string;
   message?: string;
+  retryable?: boolean;
   sources?: RetrievalSources;
   practice?: FeynmanPracticeState;
 }
 
-// parseFrame 解析单个 SSE 帧（形如 "event: xxx\ndata: {json}"）。
-function parseFrame(frame: string): SSEFrame {
+export function parseChatSSEFrame(frame: string): ChatSSEFrame {
   let event = "message";
   let data = "";
   for (const line of frame.split("\n")) {
@@ -161,36 +154,87 @@ function parseFrame(frame: string): SSEFrame {
     else if (line.startsWith("data:")) data += line.slice(5).trim();
   }
   try {
-    const obj = JSON.parse(data || "{}");
+    const obj = JSON.parse(data || "{}") as Record<string, unknown>;
     return {
       event,
-      delta: obj.delta,
-      message: obj.message,
-      sources: event === "sources" ? (obj as RetrievalSources) : undefined,
-      // 费曼练习状态挂在 done 帧上：这一轮对话可能刚刚改变了练习状态，
-      // 只有跟着收尾帧一起回来，状态条才不会滞后于刚上屏的回复。
-      practice: event === "done" ? (obj.feynman as FeynmanPracticeState | undefined) : undefined,
+      code: typeof obj.code === "number" ? obj.code : undefined,
+      delta: typeof obj.delta === "string" ? obj.delta : undefined,
+      message: typeof obj.message === "string" ? obj.message : undefined,
+      retryable: typeof obj.retryable === "boolean" ? obj.retryable : undefined,
+      sources: event === "sources" ? (obj as unknown as RetrievalSources) : undefined,
+      practice:
+        event === "done"
+          ? (obj.feynman as FeynmanPracticeState | undefined)
+          : undefined,
     };
   } catch {
     return { event };
   }
 }
 
-// sendChatStream 以 SSE 流式请求 /api/v1/chat/stream，每收到一段增量就回调 onDelta。
-// 历史上下文由后端存储层管理，前端只提交本条消息。
-// 收到 error 帧时抛异常，done 帧或流结束时正常返回。
+export interface ConsumeChatStreamCallbacks {
+  onDelta: (delta: string) => void;
+  onSources: (sources: RetrievalSources) => void;
+  onPracticeState?: (state: FeynmanPracticeState) => void;
+}
+
+export async function consumeChatSSEStream(
+  stream: ReadableStream<Uint8Array>,
+  callbacks: ConsumeChatStreamCallbacks,
+): Promise<void> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      buffer += decoder.decode();
+      throw new ChatStreamError("对话流意外中断，请重试", -1, true);
+    }
+    buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+
+    let index: number;
+    while ((index = buffer.indexOf("\n\n")) !== -1) {
+      const frame = parseChatSSEFrame(buffer.slice(0, index));
+      buffer = buffer.slice(index + 2);
+      if (frame.event === "error") {
+        throw new ChatStreamError(
+          frame.message || "对话失败",
+          frame.code ?? -1,
+          frame.retryable ?? true,
+        );
+      }
+      if (frame.event === "done") {
+        if (frame.practice) callbacks.onPracticeState?.(frame.practice);
+        return;
+      }
+      if (frame.event === "sources" && frame.sources) {
+        callbacks.onSources(frame.sources);
+      } else if (frame.delta) {
+        callbacks.onDelta(frame.delta);
+      }
+    }
+  }
+}
+
+export interface SendChatStreamOptions {
+  signal?: AbortSignal;
+  onPracticeState?: (state: FeynmanPracticeState) => void;
+  voiceCaptureID?: string;
+  coachTaskID?: string;
+  localDate?: string;
+}
+
 export async function sendChatStream(
   sessionID: string,
   clientMessageID: string,
   message: string,
   onDelta: (delta: string) => void,
   onSources: (sources: RetrievalSources) => void,
-  signal?: AbortSignal,
-  onPracticeState?: (state: FeynmanPracticeState) => void,
-  // voiceCaptureID 可选：这条消息由哪段录音转写而来。
-  // 只用于把原始转写和用户实际发出的文本关联起来，不影响任何对话逻辑。
-  voiceCaptureID?: string
+  options: SendChatStreamOptions = {},
 ): Promise<void> {
+  const { signal, onPracticeState, voiceCaptureID, coachTaskID, localDate } = options;
   const res = await fetch("/api/v1/chat/stream", {
     method: "POST",
     credentials: "include",
@@ -200,41 +244,25 @@ export async function sendChatStream(
       client_message_id: clientMessageID,
       message,
       ...(voiceCaptureID ? { voice_capture_id: voiceCaptureID } : {}),
+      ...(coachTaskID ? { coach_task_id: coachTaskID } : {}),
+      ...(localDate ? { local_date: localDate } : {}),
     }),
     signal,
   });
 
   if (!res.ok || !res.body) {
-    throw new Error("对话失败");
-  }
-
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    buffer += decoder.decode(value, { stream: true });
-
-    // SSE 各帧以空行(\n\n)分隔，攒够一帧就取出解析，剩余半帧留在 buffer 里等下一块。
-    let idx: number;
-    while ((idx = buffer.indexOf("\n\n")) !== -1) {
-      const frame = buffer.slice(0, idx);
-      buffer = buffer.slice(idx + 2);
-
-      const { event, delta, message: errMsg, sources, practice } = parseFrame(frame);
-      if (event === "error") throw new Error(errMsg || "对话失败");
-      if (event === "done") {
-        if (practice) onPracticeState?.(practice);
-        return;
-      }
-      if (event === "sources" && sources) {
-        onSources(sources);
-        continue;
-      }
-      if (delta) onDelta(delta);
+    let body: APIResponse | null = null;
+    try {
+      body = (await res.json()) as APIResponse;
+    } catch {
+      body = null;
     }
+    throw new ChatStreamError(
+      body?.message || "对话失败",
+      body?.code ?? res.status,
+      body?.retryable ?? res.status >= 500,
+    );
   }
+
+  await consumeChatSSEStream(res.body, { onDelta, onSources, onPracticeState });
 }

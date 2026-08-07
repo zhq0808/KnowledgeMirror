@@ -26,6 +26,7 @@ type Server struct {
 	documents      *service.DocumentService
 	candidates     *service.CandidateService
 	retrieval      *service.RetrievalService
+	coach          *service.CoachService
 	feynman        *service.FeynmanService
 	practice       *service.FeynmanDialogService
 	voice          *service.VoiceCaptureService
@@ -43,7 +44,7 @@ type Server struct {
 // voice 可为 nil（实时语音结果不落库，也不能绑定消息）；
 // realtimeVoice 可为 nil（实时配置不完整时 WebSocket 路由不注册）；
 // speech 可为 nil（未配置 TTS 或关闭语音合成时朗读接口不注册）。
-func NewServer(chat *service.ChatService, identity *service.IdentityService, sessions *service.SessionService, messages *service.MessageService, turnLeases *service.TurnLeaseService, documents *service.DocumentService, candidates *service.CandidateService, retrieval *service.RetrievalService, feynman *service.FeynmanService, practice *service.FeynmanDialogService, voice *service.VoiceCaptureService, realtimeVoice *service.RealtimeVoiceService, speech *service.SpeechService, memory memoryNotifier, identityConfig config.IdentityConfig, log *slog.Logger) *Server {
+func NewServer(chat *service.ChatService, identity *service.IdentityService, sessions *service.SessionService, messages *service.MessageService, turnLeases *service.TurnLeaseService, documents *service.DocumentService, candidates *service.CandidateService, retrieval *service.RetrievalService, coach *service.CoachService, feynman *service.FeynmanService, practice *service.FeynmanDialogService, voice *service.VoiceCaptureService, realtimeVoice *service.RealtimeVoiceService, speech *service.SpeechService, memory memoryNotifier, identityConfig config.IdentityConfig, log *slog.Logger) *Server {
 	gin.SetMode(gin.ReleaseMode)
 	s := &Server{
 		chat:           chat,
@@ -54,6 +55,7 @@ func NewServer(chat *service.ChatService, identity *service.IdentityService, ses
 		documents:      documents,
 		candidates:     candidates,
 		retrieval:      retrieval,
+		coach:          coach,
 		feynman:        feynman,
 		practice:       practice,
 		voice:          voice,
@@ -127,6 +129,14 @@ func (s *Server) routes() {
 		// 练习本身没有任何写接口：开始/暂停/跳过全部走 /chat/stream 的自然语言。
 		if s.practice != nil {
 			protected.GET("/feynman/practice-state", s.getFeynmanPracticeStateHandler)
+		}
+
+		// Coach 查询与执行共用一个能力位；缺少对话执行器时不注册半可用读 API。
+		if s.coach != nil && s.practice != nil {
+			coach := protected.Group("/coach")
+			coach.GET("/today", s.coachTodayHandler)
+			coach.GET("/progress", s.coachProgressHandler)
+			coach.GET("/gaps", s.coachGapsHandler)
 		}
 
 		if s.realtimeVoice != nil {

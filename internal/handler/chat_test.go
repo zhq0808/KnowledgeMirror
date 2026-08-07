@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -112,6 +113,29 @@ func (r *handlerChatRetriever) Retrieve(_ context.Context, _ service.RetrievalQu
 	return r.result, nil
 }
 
+type handlerPracticeRouter struct {
+	request service.ChatStreamRequest
+	err     error
+}
+
+func (r *handlerPracticeRouter) Handle(_ context.Context, request service.ChatStreamRequest) (bool, string, error) {
+	r.request = request
+	return false, "", r.err
+}
+
+type handlerPracticeRepository struct {
+	state service.FeynmanPracticeState
+}
+
+func (r *handlerPracticeRepository) Load(_ context.Context, _, _ string) (service.FeynmanPracticeState, bool, error) {
+	return r.state, true, nil
+}
+
+func (r *handlerPracticeRepository) Save(_ context.Context, state service.FeynmanPracticeState) error {
+	r.state = state
+	return nil
+}
+
 func (m *handlerChatModel) Timeout() time.Duration {
 	return time.Second
 }
@@ -186,6 +210,41 @@ func TestChatStreamHandlerBeginsAndCompletesTurnAroundModelCall(t *testing.T) {
 		turnLeaseRepository.lastComplete.PromptVersion != "handler-test-v2" ||
 		turnLeaseRepository.lastComplete.ModelName != "handler-test-model" {
 		t.Fatalf("complete calls=%d request=%+v", turnLeaseRepository.completeCalls, turnLeaseRepository.lastComplete)
+	}
+}
+
+func TestChatStreamHandlerIncludesCoachPracticeFieldsInDoneEvent(t *testing.T) {
+	messageRepository := &handlerMessageRepository{}
+	chatModel := &handlerChatModel{}
+	server := newChatHandlerTestServer(messageRepository, chatModel)
+	practiceRepository := &handlerPracticeRepository{state: service.FeynmanPracticeState{
+		State:                service.FeynmanStateAwaitingRetry,
+		ActiveQuestionText:   "请重新解释 Outbox",
+		RoundNo:              2,
+		CoachTaskID:          "01900000-0000-7000-8000-000000000123",
+		OriginalQuestionText: "为什么要使用 Outbox？",
+		RetryRequired:        true,
+	}}
+	server.practice = service.NewFeynmanDialogService(practiceRepository, nil, nil, service.FeynmanDialogLimits{}, server.log)
+
+	recorder := performChatRequest(server, `{
+		"session_id":"session_0123456789abcdef0123456789abcdef",
+		"client_message_id":"550e8400-e29b-41d4-a716-446655440000",
+		"message":"hello"
+	}`)
+
+	body := recorder.Body.String()
+	if recorder.Code != http.StatusOK || !strings.Contains(body, "event: done") {
+		t.Fatalf("status=%d body=%s, want done event", recorder.Code, body)
+	}
+	for _, expected := range []string{
+		`"coach_task_id":"01900000-0000-7000-8000-000000000123"`,
+		`"original_question":"为什么要使用 Outbox？"`,
+		`"retry_required":true`,
+	} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("body=%s, want %s", body, expected)
+		}
 	}
 }
 
@@ -336,6 +395,110 @@ func TestChatStreamHandlerRejectsInvalidClientMessageID(t *testing.T) {
 	}
 	if messageRepository.calls != 0 || chatModel.calls != 0 {
 		t.Fatalf("message calls=%d model calls=%d, want 0 and 0", messageRepository.calls, chatModel.calls)
+	}
+}
+
+func TestChatStreamHandlerRejectsInvalidCoachTaskID(t *testing.T) {
+	messageRepository := &handlerMessageRepository{}
+	chatModel := &handlerChatModel{}
+	turnLeaseRepository := &handlerTurnLeaseRepository{acquireResult: service.AcquireTurnLeaseResult{Acquired: true}}
+	server := newChatHandlerTestServerWithLease(messageRepository, chatModel, turnLeaseRepository)
+
+	recorder := performChatRequest(server, `{
+		"session_id":"session_0123456789abcdef0123456789abcdef",
+		"client_message_id":"550e8400-e29b-41d4-a716-446655440000",
+		"message":"hello",
+		"coach_task_id":"not-a-uuid"
+	}`)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+	}
+	if chatModel.calls != 0 {
+		t.Fatalf("model calls=%d, want 0", chatModel.calls)
+	}
+}
+
+func TestChatStreamHandlerRejectsInvalidLocalDate(t *testing.T) {
+	server := newChatHandlerTestServerWithLease(&handlerMessageRepository{}, &handlerChatModel{}, &handlerTurnLeaseRepository{})
+	recorder := performChatRequest(server, `{
+		"session_id":"session_0123456789abcdef0123456789abcdef",
+		"client_message_id":"550e8400-e29b-41d4-a716-446655440000",
+		"message":"hello",
+		"local_date":"2026-8-7"
+	}`)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestChatStreamHandlerRejectsFarLocalDate(t *testing.T) {
+	server := newChatHandlerTestServerWithLease(&handlerMessageRepository{}, &handlerChatModel{}, &handlerTurnLeaseRepository{})
+	recorder := performChatRequest(server, `{
+		"session_id":"session_0123456789abcdef0123456789abcdef",
+		"client_message_id":"550e8400-e29b-41d4-a716-446655440000",
+		"message":"hello",
+		"local_date":"2000-01-01"
+	}`)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestChatStreamHandlerPropagatesCoachTaskID(t *testing.T) {
+	messageRepository := &handlerMessageRepository{}
+	chatModel := &handlerChatModel{}
+	server := newChatHandlerTestServer(messageRepository, chatModel)
+	practice := &handlerPracticeRouter{}
+	server.chat.WithPractice(practice)
+
+	recorder := performChatRequest(server, `{
+		"session_id":"session_0123456789abcdef0123456789abcdef",
+		"client_message_id":"550e8400-e29b-41d4-a716-446655440000",
+		"message":"hello",
+		"coach_task_id":"01900000-0000-7000-8000-000000000123",
+		"local_date":"2026-08-07"
+	}`)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if practice.request.CoachTaskID != "01900000-0000-7000-8000-000000000123" || practice.request.LocalDate != "2026-08-07" {
+		t.Fatalf("practice request=%+v, want propagated coach id and local date", practice.request)
+	}
+}
+
+func TestChatStreamHandlerMapsTypedCoachErrorsToStableSSEPayload(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		code int
+	}{
+		{"not found", service.ErrCoachTaskNotFound, CodeCoachTaskNotFound},
+		{"not startable", service.ErrCoachTaskNotStartable, CodeCoachTaskNotStartable},
+		{"id required", service.ErrCoachTaskIDRequired, CodeCoachTaskIDRequired},
+		{"mismatch", service.ErrCoachTaskMismatch, CodeCoachTaskMismatch},
+		{"attempt conflict", service.ErrCoachAttemptConflict, CodeCoachAttemptConflict},
+		{"correction pending", service.ErrCoachCorrectionPending, CodeCoachCorrectionPending},
+		{"analysis input", service.ErrCoachAnalysisInput, CodeCoachAnalysisInput},
+		{"unavailable", service.ErrCoachUnavailable, CodeCoachUnavailable},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			messageRepository := &handlerMessageRepository{}
+			server := newChatHandlerTestServer(messageRepository, &handlerChatModel{})
+			server.chat.WithPractice(&handlerPracticeRouter{err: tc.err})
+			recorder := performChatRequest(server, `{
+				"session_id":"session_0123456789abcdef0123456789abcdef",
+				"client_message_id":"550e8400-e29b-41d4-a716-446655440000",
+				"message":"answer",
+				"coach_task_id":"01900000-0000-7000-8000-000000000123"
+			}`)
+			body := recorder.Body.String()
+			if !strings.Contains(body, "event: error") || !strings.Contains(body, fmt.Sprintf(`"code":%d`, tc.code)) || strings.Contains(body, "event: done") {
+				t.Fatalf("body=%q", body)
+			}
+		})
 	}
 }
 
