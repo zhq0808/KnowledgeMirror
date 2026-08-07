@@ -13,11 +13,20 @@ import (
 	"KnowledgeMirror/internal/stt"
 )
 
+type capabilitySTTProvider struct{}
+
+func (capabilitySTTProvider) Name() string { return "capability_test" }
+
+func (capabilitySTTProvider) Transcribe(context.Context, []byte, string) (stt.Transcript, error) {
+	return stt.Transcript{}, nil
+}
+
 func TestCapabilitiesHandlerReportsInjectedServices(t *testing.T) {
 	gin.SetMode(gin.ReleaseMode)
+	voice := service.NewVoiceCaptureService(nil, capabilitySTTProvider{}, nil, service.VoiceLimits{}, nil)
 	server := &Server{
 		realtimeVoice: &service.RealtimeVoiceService{},
-		voice:         &service.VoiceCaptureService{},
+		voice:         voice,
 		speech:        &service.SpeechService{},
 		coach:         &service.CoachService{},
 		practice:      &service.FeynmanDialogService{},
@@ -38,7 +47,7 @@ func TestCapabilitiesHandlerReportsInjectedServices(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
 		t.Fatalf("解析响应失败: %v", err)
 	}
-	if !response.Data.RealtimeVoice || !response.Data.Speech || !response.Data.Coach {
+	if !response.Data.RealtimeVoice || !response.Data.FileVoice || !response.Data.Speech || !response.Data.Coach {
 		t.Fatalf("能力位未反映已注入服务: %+v", response.Data)
 	}
 }
@@ -103,7 +112,7 @@ func TestCapabilitiesHandlerReportsUnavailableServices(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
 		t.Fatalf("解析响应失败: %v", err)
 	}
-	if response.Data.RealtimeVoice || response.Data.Speech || response.Data.Coach {
+	if response.Data.RealtimeVoice || response.Data.FileVoice || response.Data.Speech || response.Data.Coach {
 		t.Fatalf("未注入服务不应报告可用: %+v", response.Data)
 	}
 }
